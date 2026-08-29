@@ -1,0 +1,8 @@
+.pio/
+build/
+compile_commands.json
+test/__pycache__/
+.workbuddy/
+.agents/
+.codex/
+.vscode/
