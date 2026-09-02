@@ -715,10 +715,17 @@ static void foc_current_telemetry_task(void *pvParameter)
 }
 static void foc_current_task(void *pvParameter)
 {
-	(void)pvParameter;
+    (void)pvParameter;
+    esp_err_t result = motor_pwm_register_control_task(xTaskGetCurrentTaskHandle());
+    if (result != ESP_OK)
+    {
+        ESP_LOGE("FOC_CURRENT", "Failed to register PWM control task: %s", esp_err_to_name(result));
+        vTaskDelete(NULL);
+        return;
+    }
 	TickType_t last_wake_time = xTaskGetTickCount();
 
-	esp_err_t result = motor_pwm_set_duty(0.5f, 0.5f, 0.5f);
+	    result = motor_pwm_set_duty(0.5f, 0.5f, 0.5f);
 	if (result != ESP_OK)
 	{
 		ESP_LOGE(

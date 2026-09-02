@@ -3,15 +3,15 @@
 
 #include "driver/mcpwm_prelude.h"
 #include "esp_log.h"
-#include "esp_timer.h"
+#include "esp_attr.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 // IDF 5.5 的 mcpwm prelude 驱动没有公开读取计数器的 API，
 // 同步采样只能通过 HAL/LL 层直接读 MCPWM0 的计数器。
-#include "hal/mcpwm_ll.h"
-#include "soc/mcpwm_struct.h"
+
+
 
 // 记录三相最近一次写入的 compare 值（tick），供采样同步用
-static uint32_t s_last_compare_ticks[3] = {125, 125, 125};
-
 static const char *TAG = "MOTOR_PWM";
 
 // One timer is shared by all three phases.
@@ -24,6 +24,33 @@ static mcpwm_gen_handle_t pwm_generators[3] = {NULL, NULL, NULL};
 static bool pwm_initialized = false;
 static bool pwm_timer_enabled = false;
 static bool pwm_running = false;
+
+// The current loop is notified from the MCPWM empty event. One notification
+// is emitted every two 20 kHz PWM periods, giving a 10 kHz control tick.
+static TaskHandle_t s_control_task = NULL;
+static volatile uint32_t s_pwm_empty_events = 0;
+static volatile uint32_t s_control_tick_count = 0;
+
+static bool IRAM_ATTR motor_pwm_on_empty(
+    mcpwm_timer_handle_t timer,
+    const mcpwm_timer_event_data_t *edata,
+    void *user_ctx)
+{
+    (void)timer;
+    (void)edata;
+    (void)user_ctx;
+
+    s_pwm_empty_events++;
+    if (s_control_task == NULL || (s_pwm_empty_events & 1U) != 0U)
+    {
+        return false;
+    }
+
+    BaseType_t higher_priority_task_woken = pdFALSE;
+    s_control_tick_count++;
+    vTaskNotifyGiveFromISR(s_control_task, &higher_priority_task_woken);
+    return higher_priority_task_woken == pdTRUE;
+}
 
 static float clamp_duty(float duty)
 {
@@ -177,7 +204,17 @@ esp_err_t motor_pwm_init(void)
 		}
 	}
 
-	pwm_initialized = true;
+		mcpwm_timer_event_callbacks_t timer_callbacks = {
+		.on_empty = motor_pwm_on_empty,
+	};
+	result = mcpwm_timer_register_event_callbacks(pwm_timer, &timer_callbacks, NULL);
+	if (result != ESP_OK)
+	{
+		ESP_LOGE(TAG, "Failed to register MCPWM timer callbacks: %s", esp_err_to_name(result));
+		return result;
+	}
+
+pwm_initialized = true;
 	ESP_LOGI(TAG,
 			 "Three PWM generators configured: U=GPIO%d, V=GPIO%d, W=GPIO%d",
 			 pwm_gpio[0],
@@ -185,6 +222,28 @@ esp_err_t motor_pwm_init(void)
 			 pwm_gpio[2]);
 	ESP_LOGI(TAG, "PWM initialized in safe LOW state");
 	return ESP_OK;
+}
+
+esp_err_t motor_pwm_register_control_task(TaskHandle_t task)
+{
+    if (task == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (pwm_running)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    s_control_task = task;
+    s_pwm_empty_events = 0;
+    s_control_tick_count = 0;
+    return ESP_OK;
+}
+
+uint32_t motor_pwm_control_tick_count(void)
+{
+    return s_control_tick_count;
 }
 
 esp_err_t motor_pwm_start(void)
@@ -275,8 +334,7 @@ esp_err_t motor_pwm_set_duty(float duty_u, float duty_v, float duty_w)
 		}
 
 		// 写入成功才记录，保证同步窗口计算用的 compare 与硬件一致。
-		s_last_compare_ticks[phase] = compare_ticks;
-	}
+}
 
 	return ESP_OK;
 }
@@ -318,130 +376,4 @@ esp_err_t motor_pwm_stop(void)
 
 	ESP_LOGI(TAG, "PWM stopped, all phases forced LOW");
 	return ESP_OK;
-}
-/*
- * 等待三相低侧共同导通窗口：count > max(compare)，以计数器 TOP 为中心。
- * 返回 ESP_OK 后立刻读 ADC。timeout_us 给 200（约 4 个 PWM 周期）足够。
- *
- * 几个事实（已对照 IDF 5.5.2 源码确认）：
- * - UP_DOWN 模式下硬件计数器峰值 = period_ticks / 2 = M1_PWM_COMPARE_MAX_TICKS = 250，
- *   计数范围 0..250，tick = 1/10MHz = 0.1us，PWM 周期 2*250 tick = 50us（20kHz）。
- * - 本项目只用 group 0 的第一个 timer，因此 timer_id 固定为 0。
- * - MCPWM0 是经典 ESP32 上唯一的 MCPWM 外设。
- */
-esp_err_t motor_pwm_wait_lowside_window(uint32_t timeout_us)
-{
-	if (!pwm_running)
-	{
-		return ESP_ERR_INVALID_STATE;
-	}
-
-	uint32_t cmax = s_last_compare_ticks[0];
-	if (s_last_compare_ticks[1] > cmax)
-	{
-		cmax = s_last_compare_ticks[1];
-	}
-	if (s_last_compare_ticks[2] > cmax)
-	{
-		cmax = s_last_compare_ticks[2];
-	}
-
-	// 在窗口入口（上行越过 cmax+5）返回，剩余可用时间约 2*(250-cmax-5)*0.1us。
-	uint32_t threshold = cmax + 5;
-	if (threshold > M1_PWM_COMPARE_MAX_TICKS - 5)
-	{
-		threshold = M1_PWM_COMPARE_MAX_TICKS - 5; // 防悬死
-	}
-
-	int64_t t0 = esp_timer_get_time();
-	uint32_t loop_count = 0;
-	for (;;)
-	{
-		uint32_t count = mcpwm_ll_timer_get_count_value(&MCPWM0, 0);
-		if (count > threshold)
-		{
-			return ESP_OK;
-		}
-		// 每 16 次循环才查一次超时，避免 esp_timer 调用拖慢轮询。
-		if ((++loop_count & 0x0F) == 0 &&
-			esp_timer_get_time() - t0 > (int64_t)timeout_us)
-		{
-			return ESP_ERR_TIMEOUT;
-		}
-	}
-}
-
-// 返回 compare 最大的相：0=U 1=V 2=W（current_sense 用它决定读序）
-int motor_pwm_max_compare_phase(void)
-{
-    uint32_t cmax = s_last_compare_ticks[0];
-    int idx = 0;
-    if (s_last_compare_ticks[1] > cmax) { cmax = s_last_compare_ticks[1]; idx = 1; }
-    if (s_last_compare_ticks[2] > cmax) idx = 2;
-    return idx;
-}
-
-// 调试用：读当前计数值（诊断 status 寄存器是否实时更新）
-uint32_t motor_pwm_debug_count(void)
-{
-	return mcpwm_ll_timer_get_count_value(&MCPWM0, 0);
-}
-
-/*
- * 等计数器从下方越过 target（上升沿触发），相位扫描实验用。
- *
- * 不能直接判 count >= target：如果调用时计数器已经落在这个区间内，函数会
- * 立刻返回，起始相位完全不受控（target=75 时这个区间宽达 35us，占周期 70%）。
- * 必须先等它落到 target 以下，再等它重新涨上来，触发点才严格锁在上升沿的
- * target 处，精度约等于一个轮询周期（~0.2us）。
- */
-esp_err_t motor_pwm_wait_count_rising(uint32_t target, uint32_t timeout_us)
-{
-	if (!pwm_running)
-	{
-		return ESP_ERR_INVALID_STATE;
-	}
-
-	// 只留极小的余量：计数器峰值恰好等于 COMPARE_MAX，目标太接近峰值时
-	// 上升沿触发会不可靠。之前 clamp 到 COMPARE_MAX-10 在 20kHz 下吃掉了
-	// 一半扫描档位（240~495 全部退化成 240），这里收紧到 -5。
-	if (target < 2)
-	{
-		target = 2;
-	}
-	if (target > M1_PWM_COMPARE_MAX_TICKS - 5)
-	{
-		target = M1_PWM_COMPARE_MAX_TICKS - 5;
-	}
-
-	int64_t t0 = esp_timer_get_time();
-	uint32_t loop_count = 0;
-
-	// 阶段 1：先等计数器落到 target 以下
-	for (;;)
-	{
-		if (mcpwm_ll_timer_get_count_value(&MCPWM0, 0) < target)
-		{
-			break;
-		}
-		if ((++loop_count & 0x0F) == 0 &&
-			esp_timer_get_time() - t0 > (int64_t)timeout_us)
-		{
-			return ESP_ERR_TIMEOUT;
-		}
-	}
-
-	// 阶段 2：再等它涨回 target，此刻即为触发点
-	for (;;)
-	{
-		if (mcpwm_ll_timer_get_count_value(&MCPWM0, 0) >= target)
-		{
-			return ESP_OK;
-		}
-		if ((++loop_count & 0x0F) == 0 &&
-			esp_timer_get_time() - t0 > (int64_t)timeout_us)
-		{
-			return ESP_ERR_TIMEOUT;
-		}
-	}
 }

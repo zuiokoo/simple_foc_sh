@@ -8,6 +8,14 @@ SOURCE = ROOT / "src" / "motor" / "motor_pwm.c"
 
 
 class MotorPwmContractTest(unittest.TestCase):
+    def test_unused_compare_phase_helper_is_not_part_of_pwm_api(self):
+        header = (ROOT / "src" / "motor" / "motor_pwm.h").read_text(encoding="utf-8")
+        source = SOURCE.read_text(encoding="utf-8")
+
+        self.assertNotIn("motor_pwm_max_compare_phase", header)
+        self.assertNotIn("motor_pwm_max_compare_phase", source)
+
+
     def test_center_aligned_duty_uses_timer_peak_ticks(self):
         config = CONFIG.read_text(encoding="utf-8")
         source = SOURCE.read_text(encoding="utf-8")

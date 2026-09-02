@@ -9,6 +9,26 @@ MAIN = ROOT / "src" / "main.c"
 
 
 class CurrentSenseContractTest(unittest.TestCase):
+    def test_adc_dma_publishes_complete_frame_without_pwm_polling(self):
+        header = HEADER.read_text(encoding="utf-8")
+        source = SOURCE.read_text(encoding="utf-8")
+
+        self.assertIn("typedef struct", header)
+        self.assertIn("current_sense_frame_t", header)
+        self.assertIn("current_sense_read_latest_frame", header)
+        self.assertIn("current_sense_dma_overflow_count", header)
+        self.assertIn("adc_continuous_register_event_callbacks(", source)
+        self.assertIn("on_conv_done", source)
+        self.assertIn("on_pool_ovf", source)
+        self.assertIn("#define CURRENT_ADC_FRAME_SIZE_BYTES 40U", source)
+        self.assertIn("sizeof(adc_digi_output_data_t)", source)
+        self.assertIn("xTaskCreate(", source)
+        self.assertIn("ulTaskNotifyTake(pdTRUE, portMAX_DELAY)", source)
+        self.assertNotIn("motor_pwm_wait_lowside_window", source)
+        self.assertNotIn("motor_pwm_wait_count_rising", source)
+        self.assertNotIn("current_sense_phase_sweep", source)
+
+
     def test_adc_raw_reading_module_uses_adc1_channels(self):
         self.assertTrue(HEADER.exists(), "current sense header has not been created")
         self.assertTrue(SOURCE.exists(), "current sense source has not been created")
@@ -43,16 +63,25 @@ class CurrentSenseContractTest(unittest.TestCase):
         self.assertIn("current_sense_calibrate(void)", source)
         self.assertIn("current_sense_read_amperes(", source)
         self.assertIn("current_sense_read_three_phase(", source)
-        self.assertIn("float sample_iw_a = -(sample_iu_a + sample_iv_a);", source)
+        self.assertIn("*iw_a = -(*iu_a + *iv_a);", source)
         self.assertNotIn("current_sense_read_corrected", source)
-        self.assertIn("CURRENT_SENSE_CALIBRATION_SAMPLES", source)
+        self.assertIn("#define CURRENT_SENSE_CALIBRATION_SAMPLES 100", source)
         self.assertIn("CURRENT_SENSE_MILLIVOLTS_PER_AMP", source)
         self.assertIn("current_sense_raw_to_voltage", source)
         self.assertIn("current_u_zero_voltage_mv", source)
         self.assertIn("current_v_zero_voltage_mv", source)
         self.assertIn("current_sense_calibrated", source)
-        self.assertIn("motor_pwm_wait_lowside_window", source)
+        self.assertNotIn("motor_pwm_wait_lowside_window", source)
         self.assertNotIn("ADC_UNIT_2", source)
+
+    def test_classic_esp32_frame_is_20_results_for_10khz(self):
+        source = SOURCE.read_text(encoding="utf-8")
+
+        self.assertIn("#define CURRENT_ADC_SAMPLE_FREQ_HZ 200000U", source)
+        self.assertIn("#define CURRENT_ADC_FRAME_SIZE_BYTES 40U", source)
+        self.assertIn("#define CURRENT_ADC_MAX_STORE_BUF_SIZE_BYTES 4096U", source)
+        self.assertNotIn("static const uint32_t current_adc_frame_size_bytes", source)
+
 
     def test_main_initializes_and_reads_current_sense(self):
         main = MAIN.read_text(encoding="utf-8")
