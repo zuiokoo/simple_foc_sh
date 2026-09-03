@@ -42,6 +42,11 @@ esp_err_t current_sense_read_three_phase(
     float *iu_a,
     float *iv_a,
     float *iw_a);
+esp_err_t current_sense_read_three_phase_with_timestamp(
+    float *iu_a,
+    float *iv_a,
+    float *iw_a,
+    int64_t *timestamp_us);
 
 #ifdef __cplusplus
 }

@@ -9,6 +9,13 @@ SOURCE = ROOT / "src" / "control" / "foc_controller.c"
 
 
 class FocPiIntegrationContractTest(unittest.TestCase):
+    def test_current_pi_uses_actual_twelve_volt_bus(self):
+        main = MAIN.read_text(encoding="utf-8")
+
+        self.assertIn("FOC_TEST_PI_OUTPUT_MIN_V (-5.0f)", main)
+        self.assertIn("FOC_TEST_PI_OUTPUT_MAX_V (5.0f)", main)
+        self.assertIn("FOC_TEST_BUS_VOLTAGE_V 12.0f", main)
+
     def test_math_task_has_current_references_and_two_pi_controllers(self):
         main = MAIN.read_text(encoding="utf-8")
         header = HEADER.read_text(encoding="utf-8")

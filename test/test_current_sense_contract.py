@@ -74,6 +74,15 @@ class CurrentSenseContractTest(unittest.TestCase):
         self.assertNotIn("motor_pwm_wait_lowside_window", source)
         self.assertNotIn("ADC_UNIT_2", source)
 
+    def test_realtime_current_read_uses_dma_published_amperes(self):
+        source = SOURCE.read_text(encoding="utf-8")
+
+        self.assertIn("current_latest_iu_a", source)
+        self.assertIn("current_latest_iv_a", source)
+        self.assertIn("current_sense_raw_to_voltage(frame.iu_raw", source)
+        read_body = source.split("esp_err_t current_sense_read_amperes(", 1)[1]
+        read_body = read_body.split("esp_err_t current_sense_read_three_phase(", 1)[0]
+        self.assertNotIn("current_sense_raw_to_voltage(frame.iu_raw", read_body)
     def test_classic_esp32_frame_is_20_results_for_10khz(self):
         source = SOURCE.read_text(encoding="utf-8")
 
@@ -99,11 +108,26 @@ class CurrentSenseContractTest(unittest.TestCase):
         self.assertIn("foc_controller_reset(&foc_controller);", main)
         self.assertIn('#include "esp_timer.h"', main)
         self.assertIn("esp_timer_get_time()", main)
-        self.assertIn("FOC_CURRENT_LOOP_PERIOD_MS", main)
-        self.assertIn("controller_input.dt_s = control_dt_s;", main)
-        self.assertIn("pdMS_TO_TICKS(FOC_CURRENT_LOOP_PERIOD_MS)", main)
+        self.assertIn("FOC_CURRENT_TS_S", main)
+        self.assertIn("controller_input.dt_s = FOC_CURRENT_TS_S;", main)
+        self.assertIn("ulTaskNotifyTake(pdTRUE, portMAX_DELAY)", main)
         self.assertNotIn("current_sense_read_corrected", main)
 
+
+    def test_current_frame_timestamp_represents_sample_center(self):
+        source = SOURCE.read_text(encoding="utf-8")
+
+        self.assertIn("frame_end_timestamp_us", source)
+        self.assertIn("frame_duration_us", source)
+        self.assertIn("frame_duration_us / 2", source)
+        self.assertNotIn("20 results", source)
+    def test_current_frame_timestamp_is_returned_with_currents(self):
+        header = HEADER.read_text(encoding="utf-8")
+        source = SOURCE.read_text(encoding="utf-8")
+
+        self.assertIn("current_sense_read_three_phase_with_timestamp(", header)
+        self.assertIn("current_sense_read_three_phase_with_timestamp(", source)
+        self.assertIn("current_latest_frame.timestamp_us", source)
 
 if __name__ == "__main__":
     unittest.main()

@@ -26,7 +26,7 @@ static bool pwm_timer_enabled = false;
 static bool pwm_running = false;
 
 // The current loop is notified from the MCPWM empty event. One notification
-// is emitted every two 20 kHz PWM periods, giving a 10 kHz control tick.
+// is emitted every M1_CURRENT_LOOP_PWM_PERIODS 20 kHz PWM periods.
 static TaskHandle_t s_control_task = NULL;
 static volatile uint32_t s_pwm_empty_events = 0;
 static volatile uint32_t s_control_tick_count = 0;
@@ -41,7 +41,8 @@ static bool IRAM_ATTR motor_pwm_on_empty(
     (void)user_ctx;
 
     s_pwm_empty_events++;
-    if (s_control_task == NULL || (s_pwm_empty_events & 1U) != 0U)
+    if (s_control_task == NULL ||
+        (s_pwm_empty_events % M1_CURRENT_LOOP_PWM_PERIODS) != 0U)
     {
         return false;
     }
@@ -134,7 +135,7 @@ esp_err_t motor_pwm_init(void)
 
 		result = mcpwm_comparator_set_compare_value(
 			pwm_comparators[phase],
-			M1_PWM_PERIOD_TICKS / 2);
+			M1_PWM_COMPARE_MAX_TICKS / 2U);
 		if (result != ESP_OK)
 		{
 			ESP_LOGE(TAG, "Failed to set comparator %d: %s", phase, esp_err_to_name(result));

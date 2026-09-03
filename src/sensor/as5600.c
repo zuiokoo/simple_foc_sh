@@ -49,6 +49,8 @@ esp_err_t as5600_init(void)
 		.dev_addr_length = I2C_ADDR_BIT_LEN_7,
 		.device_address = M1_AS5600_ADDRESS,
 		.scl_speed_hz = AS5600_I2C_FREQUENCY_HZ,
+		/* Avoid the ESP-IDF 5.5 NACK path that can busy-wait forever. */
+		.flags.disable_ack_check = true,
 	};
 
 	result = i2c_master_bus_add_device(

@@ -25,6 +25,20 @@ class ElectricalAlignmentContractTest(unittest.TestCase):
         self.assertLess(duty_index, start_index)
         self.assertLess(start_index, stop_index)
 
+    def test_alignment_rejects_noise_sized_current_vector(self):
+        main = MAIN.read_text(encoding="utf-8")
+        config = CONFIG.read_text(encoding="utf-8")
+
+        self.assertIn("M1_ALIGNMENT_MIN_CURRENT_A", config)
+        self.assertIn("alignment_current_magnitude", main)
+        self.assertIn("alignment_current_magnitude < M1_ALIGNMENT_MIN_CURRENT_A", main)
+
+    def test_alignment_uses_commanded_vector_for_zero(self):
+        main = MAIN.read_text(encoding="utf-8")
+
+        self.assertIn("electrical_zero_offset = mechanical_electrical_angle;", main)
+        self.assertNotIn("mechanical_electrical_angle - alignment_electrical_angle", main)
+
     def test_alignment_logs_electrical_zero_offset(self):
         main = MAIN.read_text(encoding="utf-8")
 

@@ -20,6 +20,8 @@ class As5600ContractTest(unittest.TestCase):
         self.assertIn('#include "driver/i2c_master.h"', source)
         self.assertIn("i2c_new_master_bus(", source)
         self.assertIn("i2c_master_bus_add_device(", source)
+        self.assertIn("#define AS5600_I2C_FREQUENCY_HZ 400000U", source)
+        self.assertIn(".flags.disable_ack_check = true", source)
         self.assertNotIn("i2c_param_config(", source)
         self.assertNotIn("i2c_driver_install(", source)
 

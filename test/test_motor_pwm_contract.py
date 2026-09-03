@@ -15,7 +15,6 @@ class MotorPwmContractTest(unittest.TestCase):
         self.assertNotIn("motor_pwm_max_compare_phase", header)
         self.assertNotIn("motor_pwm_max_compare_phase", source)
 
-
     def test_center_aligned_duty_uses_timer_peak_ticks(self):
         config = CONFIG.read_text(encoding="utf-8")
         source = SOURCE.read_text(encoding="utf-8")
@@ -25,7 +24,10 @@ class MotorPwmContractTest(unittest.TestCase):
             config,
         )
         self.assertIn("duty[phase] * M1_PWM_COMPARE_MAX_TICKS", source)
-        self.assertNotIn("duty[phase] * M1_PWM_PERIOD_TICKS", source)
+        self.assertIn(
+            "(M1_PWM_TIMER_RESOLUTION_HZ / \\\n\t M1_PWM_FREQUENCY_HZ)",
+            config,
+        )
 
 
 if __name__ == "__main__":

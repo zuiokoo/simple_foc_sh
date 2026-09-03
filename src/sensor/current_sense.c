@@ -21,8 +21,8 @@
 /*
  * ADC1 runs at 200 kHz.  On the classic ESP32 one logical DMA result is
  * sizeof(adc_digi_output_data_t) bytes: 12 bits of data plus 4 bits of
- * channel information.  A 40-byte frame contains 20 results (about 10 U
- * samples and 10 V samples), giving about one complete frame every 100 us.
+ * channel information.  A 40-byte frame contains 10 results (about 5 U
+ * samples and 5 V samples), giving about one complete frame every 50 us.
  */
 #define CURRENT_SENSE_CALIBRATION_SAMPLES 100
 #define CURRENT_ADC_SAMPLE_FREQ_HZ 200000U
@@ -50,6 +50,9 @@ static volatile uint32_t current_dma_overflow_count = 0;
 static int current_u_zero_voltage_mv = 0;
 static int current_v_zero_voltage_mv = 0;
 static bool current_sense_calibrated = false;
+static volatile float current_latest_iu_a = 0.0f;
+static volatile float current_latest_iv_a = 0.0f;
+static volatile bool current_amperes_valid = false;
 
 static esp_err_t current_sense_raw_to_voltage(int raw, int *voltage_mv)
 {
@@ -138,17 +141,56 @@ static void current_sense_publish_frame(
 		return;
 	}
 
+	/*
+	 * adc_continuous_read() wakes the DMA task after the frame has arrived.
+	 * The averaged current represents the middle of the frame, not its end.
+	 * Use the actual byte count so the timestamp remains correct if the
+	 * driver returns a shorter complete frame.
+	 */
+	int64_t frame_end_timestamp_us = esp_timer_get_time();
+	int64_t frame_duration_us =
+		((int64_t)bytes_read * 1000000LL) /
+		((int64_t)sizeof(adc_digi_output_data_t) * CURRENT_ADC_SAMPLE_FREQ_HZ);
+	if (frame_duration_us < 1)
+	{
+		frame_duration_us = 1;
+	}
+
 	current_sense_frame_t frame = {
 		.sequence = 0U,
-		.timestamp_us = esp_timer_get_time(),
+		.timestamp_us = frame_end_timestamp_us - frame_duration_us / 2,
 		.iu_raw = (int)((sum_u + (int64_t)(count_u / 2U)) / (int64_t)count_u),
 		.iv_raw = (int)((sum_v + (int64_t)(count_v / 2U)) / (int64_t)count_v),
 	};
+
+	float latest_iu_a = 0.0f;
+	float latest_iv_a = 0.0f;
+	bool latest_amperes_valid = false;
+	if (current_sense_calibrated)
+	{
+		int u_voltage_mv = 0;
+		int v_voltage_mv = 0;
+		if (current_sense_raw_to_voltage(frame.iu_raw, &u_voltage_mv) == ESP_OK &&
+			current_sense_raw_to_voltage(frame.iv_raw, &v_voltage_mv) == ESP_OK)
+		{
+			latest_iu_a = -(((float)u_voltage_mv - current_u_zero_voltage_mv) /
+				CURRENT_SENSE_MILLIVOLTS_PER_AMP);
+			latest_iv_a = -(((float)v_voltage_mv - current_v_zero_voltage_mv) /
+				CURRENT_SENSE_MILLIVOLTS_PER_AMP);
+			latest_amperes_valid = true;
+		}
+	}
 
 	portENTER_CRITICAL(&current_frame_lock);
 	frame.sequence = ++current_frame_sequence;
 	current_latest_frame = frame;
 	current_frame_valid = true;
+	if (latest_amperes_valid)
+	{
+		current_latest_iu_a = latest_iu_a;
+		current_latest_iv_a = latest_iv_a;
+		current_amperes_valid = true;
+	}
 	current_dma_frame_count++;
 	portEXIT_CRITICAL(&current_frame_lock);
 }
@@ -159,11 +201,11 @@ static void current_sense_dma_task(void *pv_parameter)
 
     uint8_t frame_buffer[CURRENT_ADC_FRAME_SIZE_BYTES];
 
-	while (true)
+	while (1)
 	{
 		ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
-		while (true)
+		while (1)
 		{
 			uint32_t bytes_read = 0U;
 			esp_err_t result = adc_continuous_read(
@@ -206,6 +248,9 @@ esp_err_t current_sense_init(void)
 	current_u_zero_voltage_mv = 0;
 	current_v_zero_voltage_mv = 0;
 	current_sense_calibrated = false;
+	current_latest_iu_a = 0.0f;
+	current_latest_iv_a = 0.0f;
+	current_amperes_valid = false;
 	current_adc_cali_handle = NULL;
 	current_adc_task_handle = NULL;
 	current_frame_valid = false;
@@ -487,39 +532,24 @@ esp_err_t current_sense_read_amperes(float *iu_a, float *iv_a)
 		return ESP_ERR_INVALID_STATE;
 	}
 
-	current_sense_frame_t frame = {0};
-	esp_err_t result = current_sense_read_latest_frame(&frame);
-	if (result != ESP_OK)
+	portENTER_CRITICAL(&current_frame_lock);
+	bool valid = current_amperes_valid;
+	if (valid)
 	{
-		return result;
+		*iu_a = current_latest_iu_a;
+		*iv_a = current_latest_iv_a;
 	}
+	portEXIT_CRITICAL(&current_frame_lock);
 
-	int u_voltage_mv = 0;
-	int v_voltage_mv = 0;
-	result = current_sense_raw_to_voltage(frame.iu_raw, &u_voltage_mv);
-	if (result != ESP_OK)
-	{
-		return result;
-	}
-	result = current_sense_raw_to_voltage(frame.iv_raw, &v_voltage_mv);
-	if (result != ESP_OK)
-	{
-		return result;
-	}
-
-	*iu_a = -(((float)u_voltage_mv - current_u_zero_voltage_mv) /
-              CURRENT_SENSE_MILLIVOLTS_PER_AMP);
-	*iv_a = -(((float)v_voltage_mv - current_v_zero_voltage_mv) /
-              CURRENT_SENSE_MILLIVOLTS_PER_AMP);
-	return ESP_OK;
+	return valid ? ESP_OK : ESP_ERR_TIMEOUT;
 }
-
-esp_err_t current_sense_read_three_phase(
+esp_err_t current_sense_read_three_phase_with_timestamp(
 	float *iu_a,
 	float *iv_a,
-	float *iw_a)
+	float *iw_a,
+	int64_t *timestamp_us)
 {
-	if (iu_a == NULL || iv_a == NULL || iw_a == NULL)
+	if (iu_a == NULL || iv_a == NULL || iw_a == NULL || timestamp_us == NULL)
 	{
 		ESP_LOGW(TAG, "three-phase current output pointer is NULL");
 		return ESP_ERR_INVALID_ARG;
@@ -530,15 +560,38 @@ esp_err_t current_sense_read_three_phase(
 		return ESP_ERR_INVALID_STATE;
 	}
 
-	esp_err_t result = current_sense_read_amperes(iu_a, iv_a);
-	if (result != ESP_OK)
+	portENTER_CRITICAL(&current_frame_lock);
+	bool valid = current_amperes_valid;
+	if (valid)
+	{
+		*iu_a = current_latest_iu_a;
+		*iv_a = current_latest_iv_a;
+		*timestamp_us = current_latest_frame.timestamp_us;
+	}
+	portEXIT_CRITICAL(&current_frame_lock);
+
+	if (!valid)
 	{
 		*iu_a = 0.0f;
 		*iv_a = 0.0f;
 		*iw_a = 0.0f;
-		return result;
+		*timestamp_us = 0;
+		return ESP_ERR_TIMEOUT;
 	}
 
 	*iw_a = -(*iu_a + *iv_a);
 	return ESP_OK;
+}
+
+esp_err_t current_sense_read_three_phase(
+	float *iu_a,
+	float *iv_a,
+	float *iw_a)
+{
+	int64_t timestamp_us = 0;
+	return current_sense_read_three_phase_with_timestamp(
+		iu_a,
+		iv_a,
+		iw_a,
+		&timestamp_us);
 }
