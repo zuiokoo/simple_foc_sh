@@ -47,10 +47,16 @@ esp_err_t foc_controller_step(foc_controller_t *controller, const foc_controller
 		!isfinite(input->iv_a) ||
 		!isfinite(input->iw_a) ||
 		!isfinite(input->electrical_angle_rad) ||
+		!isfinite(input->output_electrical_angle_rad) ||
 		!isfinite(input->id_ref_a) ||
 		!isfinite(input->iq_ref_a) ||
 		!isfinite(input->dt_s) ||
-		!isfinite(input->bus_voltage_v))
+		!isfinite(input->bus_voltage_v) ||
+		!isfinite(input->electrical_velocity_rad_s) ||
+		!isfinite(input->motor_phase_resistance_ohm) ||
+		!isfinite(input->motor_inductance_d_h) ||
+		!isfinite(input->motor_inductance_q_h) ||
+		!isfinite(input->motor_flux_linkage_wb))
 	{
 		return ESP_ERR_INVALID_ARG;
 	}
@@ -58,7 +64,11 @@ esp_err_t foc_controller_step(foc_controller_t *controller, const foc_controller
 	{
 		return ESP_ERR_INVALID_ARG;
 	}
-	if (input->bus_voltage_v <= 0.0f)
+		if (input->bus_voltage_v <= 0.0f ||
+		input->motor_phase_resistance_ohm < 0.0f ||
+		input->motor_inductance_d_h < 0.0f ||
+		input->motor_inductance_q_h < 0.0f ||
+		input->motor_flux_linkage_wb < 0.0f)
 	{
 		return ESP_ERR_INVALID_ARG;
 	}
@@ -75,9 +85,72 @@ esp_err_t foc_controller_step(foc_controller_t *controller, const foc_controller
 	output->id_error_a = input->id_ref_a - output->i_d_a;
 	output->iq_error_a = input->iq_ref_a - output->i_q_a;
 
-	output->vd_v = foc_pi_update(&controller->id_pi, output->id_error_a, input->dt_s);
-	output->vq_v = foc_pi_update(&controller->iq_pi, output->iq_error_a, input->dt_s);
-	result = foc_inverse_park_transform(output->vd_v, output->vq_v, input->electrical_angle_rad, &output->v_alpha_v, &output->v_beta_v);
+		float vd_pi_v = foc_pi_update(&controller->id_pi, output->id_error_a, input->dt_s);
+	float vq_pi_v = foc_pi_update(&controller->iq_pi, output->iq_error_a, input->dt_s);
+
+	/*
+	 * PMSM dq model in the Park convention used above:
+	 *   vd_ff = Rs*Id - omega_e*Lq*Iq
+	 *   vq_ff = Rs*Iq + omega_e*(Ld*Id + flux)
+	 * The PI then only has to correct parameter error and transients.
+	 */
+	output->vd_decoupling_v =
+		input->motor_phase_resistance_ohm * output->i_d_a -
+		input->electrical_velocity_rad_s *
+			input->motor_inductance_q_h * output->i_q_a;
+	output->vq_decoupling_v =
+		input->motor_phase_resistance_ohm * output->i_q_a +
+		input->electrical_velocity_rad_s *
+			(input->motor_inductance_d_h * output->i_d_a +
+			 input->motor_flux_linkage_wb);
+
+	float raw_vd_v = vd_pi_v + output->vd_decoupling_v;
+	float raw_vq_v = vq_pi_v + output->vq_decoupling_v;
+	output->vd_v = raw_vd_v;
+	output->vq_v = raw_vq_v;
+
+	/*
+	 * The phase-duty implementation reserves 5%% at both ends.  Limit the
+	 * dq vector to the corresponding linear SVPWM hexagon radius before
+	 * inverse Park, so the three phases cannot silently overmodulate.
+	 */
+	output->voltage_vector_limit_v =
+		input->bus_voltage_v * 0.90f / 1.7320508075688772f;
+	float voltage_magnitude_v =
+		sqrtf(output->vd_v * output->vd_v + output->vq_v * output->vq_v);
+	if (voltage_magnitude_v > output->voltage_vector_limit_v &&
+		voltage_magnitude_v > 0.0f)
+	{
+		float scale = output->voltage_vector_limit_v / voltage_magnitude_v;
+		output->vd_v *= scale;
+		output->vq_v *= scale;
+
+		/*
+		 * The final dq vector is the actuator limit.  Feed the rejected
+		 * voltage back into both PI integrators so the two regulators do
+		 * not wind up independently while the combined vector is saturated.
+		 */
+		controller->id_pi.integral += output->vd_v - raw_vd_v;
+		controller->iq_pi.integral += output->vq_v - raw_vq_v;
+		if (controller->id_pi.integral < controller->id_pi.output_min)
+		{
+			controller->id_pi.integral = controller->id_pi.output_min;
+		}
+		else if (controller->id_pi.integral > controller->id_pi.output_max)
+		{
+			controller->id_pi.integral = controller->id_pi.output_max;
+		}
+		if (controller->iq_pi.integral < controller->iq_pi.output_min)
+		{
+			controller->iq_pi.integral = controller->iq_pi.output_min;
+		}
+		else if (controller->iq_pi.integral > controller->iq_pi.output_max)
+		{
+			controller->iq_pi.integral = controller->iq_pi.output_max;
+		}
+	}
+
+	result = foc_inverse_park_transform(output->vd_v, output->vq_v, input->output_electrical_angle_rad, &output->v_alpha_v, &output->v_beta_v);
 	if (result != ESP_OK)
 	{
 		return result;

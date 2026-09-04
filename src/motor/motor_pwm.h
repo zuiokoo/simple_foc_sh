@@ -25,12 +25,14 @@ esp_err_t motor_pwm_stop(void);
 /*
  * Real-time current-loop tick.
  *
- * The MCPWM timer ISR emits one task notification every twelve 20 kHz PWM
- * periods. This produces the conservative 2.5 kHz control-loop wakeup used
+ * The MCPWM timer ISR emits one task notification every four 20 kHz PWM
+ * periods. This produces the 5 kHz current-loop wakeup
  * during current-loop bring-up. Register the consumer before motor_pwm_start().
  */
 esp_err_t motor_pwm_register_control_task(TaskHandle_t task);
-uint32_t motor_pwm_control_tick_count(void);
+
+/* Timestamp of the latest PWM center event that generated a control tick. */
+uint32_t motor_pwm_get_control_tick_timestamp_us(void);
 
 #ifdef __cplusplus
 }

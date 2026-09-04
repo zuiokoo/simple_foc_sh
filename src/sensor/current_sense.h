@@ -23,6 +23,8 @@ typedef struct
     int64_t timestamp_us;
     int iu_raw;
     int iv_raw;
+    float iu_a;
+    float iv_a;
 } current_sense_frame_t;
 
 esp_err_t current_sense_init(void);
@@ -33,11 +35,7 @@ esp_err_t current_sense_calibrate(void);
  * conversion and without touching PWM timing.
  */
 esp_err_t current_sense_read_latest_frame(current_sense_frame_t *frame);
-uint32_t current_sense_dma_frame_count(void);
-uint32_t current_sense_dma_overflow_count(void);
 
-esp_err_t current_sense_read(int *iu_raw, int *iv_raw);
-esp_err_t current_sense_read_amperes(float *iu_a, float *iv_a);
 esp_err_t current_sense_read_three_phase(
     float *iu_a,
     float *iv_a,
@@ -47,6 +45,20 @@ esp_err_t current_sense_read_three_phase_with_timestamp(
     float *iv_a,
     float *iw_a,
     int64_t *timestamp_us);
+/* Read the newest complete frame whose timestamp is not later than the target time. */
+esp_err_t current_sense_read_three_phase_at_or_before_timestamp(
+    float *iu_a,
+    float *iv_a,
+    float *iw_a,
+    int64_t target_timestamp_us,
+    int64_t *timestamp_us,
+    uint32_t *sequence);
+esp_err_t current_sense_read_three_phase_with_timestamp_and_sequence(
+    float *iu_a,
+    float *iv_a,
+    float *iw_a,
+    int64_t *timestamp_us,
+    uint32_t *sequence);
 
 #ifdef __cplusplus
 }

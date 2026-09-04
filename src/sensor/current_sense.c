@@ -21,12 +21,12 @@
 /*
  * ADC1 runs at 200 kHz.  On the classic ESP32 one logical DMA result is
  * sizeof(adc_digi_output_data_t) bytes: 12 bits of data plus 4 bits of
- * channel information.  A 40-byte frame contains 10 results (about 5 U
- * samples and 5 V samples), giving about one complete frame every 50 us.
+ * channel information.  A 32-byte frame contains 8 results (about 4 U
+ * samples and 4 V samples), balancing latency and switching-ripple averaging.
  */
 #define CURRENT_SENSE_CALIBRATION_SAMPLES 100
 #define CURRENT_ADC_SAMPLE_FREQ_HZ 200000U
-#define CURRENT_ADC_FRAME_SIZE_BYTES 40U
+#define CURRENT_ADC_FRAME_SIZE_BYTES 32U
 #define CURRENT_ADC_MAX_STORE_BUF_SIZE_BYTES 4096U
 #define CURRENT_ADC_TASK_STACK_WORDS 3072U
 #define CURRENT_ADC_TASK_PRIORITY 8U
@@ -44,8 +44,20 @@ static portMUX_TYPE current_frame_lock = portMUX_INITIALIZER_UNLOCKED;
 static current_sense_frame_t current_latest_frame = {0};
 static bool current_frame_valid = false;
 static uint32_t current_frame_sequence = 0;
-static volatile uint32_t current_dma_frame_count = 0;
-static volatile uint32_t current_dma_overflow_count = 0;
+static volatile uint32_t current_adc_last_conv_done_timestamp_us = 0U;
+static int64_t current_adc_previous_frame_end_timestamp_us = 0;
+enum { CURRENT_ADC_TIMESTAMP_RING_SIZE = 64 };
+enum { CURRENT_FRAME_HISTORY_SIZE = 16 };
+
+static portMUX_TYPE current_adc_timestamp_lock = portMUX_INITIALIZER_UNLOCKED;
+static volatile int64_t current_adc_frame_timestamps_us[CURRENT_ADC_TIMESTAMP_RING_SIZE] = {0};
+static volatile uint32_t current_adc_timestamp_write_index = 0U;
+static volatile uint32_t current_adc_timestamp_read_index = 0U;
+static volatile uint32_t current_adc_timestamp_count = 0U;
+
+static current_sense_frame_t current_frame_history[CURRENT_FRAME_HISTORY_SIZE] = {0};
+static uint32_t current_frame_history_write_index = 0U;
+static uint32_t current_frame_history_count = 0U;
 
 static int current_u_zero_voltage_mv = 0;
 static int current_v_zero_voltage_mv = 0;
@@ -76,6 +88,24 @@ static bool IRAM_ATTR current_sense_on_conv_done(
 	(void)handle;
 	(void)edata;
 	(void)user_data;
+	current_adc_last_conv_done_timestamp_us = (uint32_t)esp_timer_get_time();
+	int64_t conversion_timestamp_us = current_adc_last_conv_done_timestamp_us;
+	portENTER_CRITICAL_ISR(&current_adc_timestamp_lock);
+	if (current_adc_timestamp_count < CURRENT_ADC_TIMESTAMP_RING_SIZE)
+	{
+		current_adc_frame_timestamps_us[current_adc_timestamp_write_index] = conversion_timestamp_us;
+		current_adc_timestamp_write_index =
+			(current_adc_timestamp_write_index + 1U) % CURRENT_ADC_TIMESTAMP_RING_SIZE;
+		current_adc_timestamp_count++;
+	}
+	else
+	{
+		current_adc_frame_timestamps_us[current_adc_timestamp_write_index] = conversion_timestamp_us;
+		current_adc_timestamp_write_index =
+			(current_adc_timestamp_write_index + 1U) % CURRENT_ADC_TIMESTAMP_RING_SIZE;
+		current_adc_timestamp_read_index = current_adc_timestamp_write_index;
+	}
+	portEXIT_CRITICAL_ISR(&current_adc_timestamp_lock);
 
 	if (current_adc_task_handle == NULL)
 	{
@@ -96,8 +126,6 @@ static bool IRAM_ATTR current_sense_on_pool_overflow(
 	(void)edata;
 	(void)user_data;
 
-	current_dma_overflow_count++;
-
 	if (current_adc_task_handle == NULL)
 	{
 		return false;
@@ -108,9 +136,24 @@ static bool IRAM_ATTR current_sense_on_pool_overflow(
 	return higher_priority_task_woken == pdTRUE;
 }
 
+static int64_t current_sense_take_frame_timestamp(void)
+{
+    int64_t timestamp_us = 0;
+    portENTER_CRITICAL(&current_adc_timestamp_lock);
+    if (current_adc_timestamp_count > 0U)
+    {
+        timestamp_us = current_adc_frame_timestamps_us[current_adc_timestamp_read_index];
+        current_adc_timestamp_read_index =
+            (current_adc_timestamp_read_index + 1U) % CURRENT_ADC_TIMESTAMP_RING_SIZE;
+        current_adc_timestamp_count--;
+    }
+    portEXIT_CRITICAL(&current_adc_timestamp_lock);
+    return timestamp_us;
+}
 static void current_sense_publish_frame(
 	const uint8_t *buffer,
-	uint32_t bytes_read)
+	uint32_t bytes_read,
+	int64_t frame_end_timestamp_us)
 {
 	int64_t sum_u = 0;
 	int64_t sum_v = 0;
@@ -147,10 +190,30 @@ static void current_sense_publish_frame(
 	 * Use the actual byte count so the timestamp remains correct if the
 	 * driver returns a shorter complete frame.
 	 */
-	int64_t frame_end_timestamp_us = esp_timer_get_time();
+	if (frame_end_timestamp_us == 0)
+	{
+		frame_end_timestamp_us = esp_timer_get_time();
+	}
 	int64_t frame_duration_us =
 		((int64_t)bytes_read * 1000000LL) /
 		((int64_t)sizeof(adc_digi_output_data_t) * CURRENT_ADC_SAMPLE_FREQ_HZ);
+	/*
+	 * The configured ADC rate is a request.  The actual continuous-driver
+	 * frame cadence can be lower, so use adjacent DMA completion timestamps
+	 * whenever available.  This keeps the averaged current aligned to the
+	 * real middle of the frame instead of the nominal middle.
+	 */
+	if (current_adc_previous_frame_end_timestamp_us != 0 &&
+		frame_end_timestamp_us > current_adc_previous_frame_end_timestamp_us)
+	{
+		int64_t measured_frame_duration_us =
+			frame_end_timestamp_us - current_adc_previous_frame_end_timestamp_us;
+		if (measured_frame_duration_us <= 1000)
+		{
+			frame_duration_us = measured_frame_duration_us;
+		}
+	}
+	current_adc_previous_frame_end_timestamp_us = frame_end_timestamp_us;
 	if (frame_duration_us < 1)
 	{
 		frame_duration_us = 1;
@@ -161,6 +224,8 @@ static void current_sense_publish_frame(
 		.timestamp_us = frame_end_timestamp_us - frame_duration_us / 2,
 		.iu_raw = (int)((sum_u + (int64_t)(count_u / 2U)) / (int64_t)count_u),
 		.iv_raw = (int)((sum_v + (int64_t)(count_v / 2U)) / (int64_t)count_v),
+        .iu_a = 0.0f,
+        .iv_a = 0.0f,
 	};
 
 	float latest_iu_a = 0.0f;
@@ -181,17 +246,29 @@ static void current_sense_publish_frame(
 		}
 	}
 
-	portENTER_CRITICAL(&current_frame_lock);
+	    if (latest_amperes_valid)
+    {
+        frame.iu_a = latest_iu_a;
+        frame.iv_a = latest_iv_a;
+    }
+
+portENTER_CRITICAL(&current_frame_lock);
 	frame.sequence = ++current_frame_sequence;
 	current_latest_frame = frame;
 	current_frame_valid = true;
+current_frame_history[current_frame_history_write_index] = frame;
+current_frame_history_write_index =
+    (current_frame_history_write_index + 1U) % CURRENT_FRAME_HISTORY_SIZE;
+if (current_frame_history_count < CURRENT_FRAME_HISTORY_SIZE)
+{
+    current_frame_history_count++;
+}
 	if (latest_amperes_valid)
 	{
 		current_latest_iu_a = latest_iu_a;
 		current_latest_iv_a = latest_iv_a;
 		current_amperes_valid = true;
 	}
-	current_dma_frame_count++;
 	portEXIT_CRITICAL(&current_frame_lock);
 }
 
@@ -232,7 +309,7 @@ static void current_sense_dma_task(void *pv_parameter)
 				break;
 			}
 
-			current_sense_publish_frame(frame_buffer, bytes_read);
+			current_sense_publish_frame(frame_buffer, bytes_read, current_sense_take_frame_timestamp());
 		}
 	}
 }
@@ -255,8 +332,13 @@ esp_err_t current_sense_init(void)
 	current_adc_task_handle = NULL;
 	current_frame_valid = false;
 	current_frame_sequence = 0U;
-	current_dma_frame_count = 0U;
-	current_dma_overflow_count = 0U;
+	current_adc_last_conv_done_timestamp_us = 0U;
+	current_adc_previous_frame_end_timestamp_us = 0;
+	current_adc_timestamp_write_index = 0U;
+	current_adc_timestamp_read_index = 0U;
+	current_adc_timestamp_count = 0U;
+	current_frame_history_write_index = 0U;
+	current_frame_history_count = 0U;
 
 	adc_continuous_handle_cfg_t handle_config = {
         .max_store_buf_size = CURRENT_ADC_MAX_STORE_BUF_SIZE_BYTES,
@@ -332,13 +414,13 @@ esp_err_t current_sense_init(void)
 		.on_pool_ovf = current_sense_on_pool_overflow,
 	};
 
-	result = xTaskCreate(
-				 current_sense_dma_task,
+	result = xTaskCreatePinnedToCore(
+                 current_sense_dma_task,
 				 "current_adc_dma",
         CURRENT_ADC_TASK_STACK_WORDS,
 				 NULL,
         CURRENT_ADC_TASK_PRIORITY,
-				 &current_adc_task_handle) == pdPASS
+				 &current_adc_task_handle, 1) == pdPASS
 				 ? ESP_OK
 				 : ESP_ERR_NO_MEM;
 	if (result != ESP_OK)
@@ -418,36 +500,6 @@ esp_err_t current_sense_read_latest_frame(current_sense_frame_t *frame)
 	return valid ? ESP_OK : ESP_ERR_TIMEOUT;
 }
 
-uint32_t current_sense_dma_frame_count(void)
-{
-	return current_dma_frame_count;
-}
-
-uint32_t current_sense_dma_overflow_count(void)
-{
-	return current_dma_overflow_count;
-}
-
-esp_err_t current_sense_read(int *iu_raw, int *iv_raw)
-{
-	if (iu_raw == NULL || iv_raw == NULL)
-	{
-		ESP_LOGW(TAG, "current output pointer is NULL");
-		return ESP_ERR_INVALID_ARG;
-	}
-
-	current_sense_frame_t frame = {0};
-	esp_err_t result = current_sense_read_latest_frame(&frame);
-	if (result != ESP_OK)
-	{
-		return result;
-	}
-
-	*iu_raw = frame.iu_raw;
-	*iv_raw = frame.iv_raw;
-	return ESP_OK;
-}
-
 esp_err_t current_sense_calibrate(void)
 {
 	if (current_adc_handle == NULL)
@@ -519,37 +571,70 @@ esp_err_t current_sense_calibrate(void)
 	return ESP_OK;
 }
 
-esp_err_t current_sense_read_amperes(float *iu_a, float *iv_a)
+esp_err_t current_sense_read_three_phase_at_or_before_timestamp(
+    float *iu_a,
+    float *iv_a,
+    float *iw_a,
+    int64_t target_timestamp_us,
+    int64_t *timestamp_us,
+    uint32_t *sequence)
 {
-	if (iu_a == NULL || iv_a == NULL)
-	{
-		ESP_LOGW(TAG, "ampere output pointer is NULL");
-		return ESP_ERR_INVALID_ARG;
-	}
-	if (!current_sense_calibrated)
-	{
-		ESP_LOGW(TAG, "current sense is not calibrated");
-		return ESP_ERR_INVALID_STATE;
-	}
+    if (iu_a == NULL || iv_a == NULL || iw_a == NULL ||
+        timestamp_us == NULL || sequence == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (current_adc_handle == NULL || !current_sense_calibrated)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
 
-	portENTER_CRITICAL(&current_frame_lock);
-	bool valid = current_amperes_valid;
-	if (valid)
-	{
-		*iu_a = current_latest_iu_a;
-		*iv_a = current_latest_iv_a;
-	}
-	portEXIT_CRITICAL(&current_frame_lock);
+    current_sense_frame_t selected_frame = {0};
+    bool selected_valid = false;
+    portENTER_CRITICAL(&current_frame_lock);
+    for (uint32_t i = 0U; i < current_frame_history_count; i++)
+    {
+        uint32_t index =
+            (current_frame_history_write_index + CURRENT_FRAME_HISTORY_SIZE - 1U - i) %
+            CURRENT_FRAME_HISTORY_SIZE;
+        current_sense_frame_t candidate = current_frame_history[index];
+        if (candidate.timestamp_us <= target_timestamp_us &&
+            (!selected_valid || candidate.timestamp_us > selected_frame.timestamp_us))
+        {
+            selected_frame = candidate;
+            selected_valid = true;
+        }
+    }
+    portEXIT_CRITICAL(&current_frame_lock);
 
-	return valid ? ESP_OK : ESP_ERR_TIMEOUT;
+    if (!selected_valid)
+    {
+        *iu_a = 0.0f;
+        *iv_a = 0.0f;
+        *iw_a = 0.0f;
+        *timestamp_us = 0;
+        *sequence = 0U;
+        return ESP_ERR_TIMEOUT;
+    }
+
+    /* Calibration is done once in the DMA task; the control task only copies cached amperes. */
+    *iu_a = selected_frame.iu_a;
+    *iv_a = selected_frame.iv_a;
+
+    *iw_a = -(*iu_a + *iv_a);
+    *timestamp_us = selected_frame.timestamp_us;
+    *sequence = selected_frame.sequence;
+    return ESP_OK;
 }
-esp_err_t current_sense_read_three_phase_with_timestamp(
+esp_err_t current_sense_read_three_phase_with_timestamp_and_sequence(
 	float *iu_a,
 	float *iv_a,
 	float *iw_a,
-	int64_t *timestamp_us)
+	int64_t *timestamp_us,
+	uint32_t *sequence)
 {
-	if (iu_a == NULL || iv_a == NULL || iw_a == NULL || timestamp_us == NULL)
+	if (iu_a == NULL || iv_a == NULL || iw_a == NULL ||
+		timestamp_us == NULL || sequence == NULL)
 	{
 		ESP_LOGW(TAG, "three-phase current output pointer is NULL");
 		return ESP_ERR_INVALID_ARG;
@@ -567,6 +652,7 @@ esp_err_t current_sense_read_three_phase_with_timestamp(
 		*iu_a = current_latest_iu_a;
 		*iv_a = current_latest_iv_a;
 		*timestamp_us = current_latest_frame.timestamp_us;
+		*sequence = current_latest_frame.sequence;
 	}
 	portEXIT_CRITICAL(&current_frame_lock);
 
@@ -576,11 +662,27 @@ esp_err_t current_sense_read_three_phase_with_timestamp(
 		*iv_a = 0.0f;
 		*iw_a = 0.0f;
 		*timestamp_us = 0;
+		*sequence = 0U;
 		return ESP_ERR_TIMEOUT;
 	}
 
 	*iw_a = -(*iu_a + *iv_a);
 	return ESP_OK;
+}
+
+esp_err_t current_sense_read_three_phase_with_timestamp(
+	float *iu_a,
+	float *iv_a,
+	float *iw_a,
+	int64_t *timestamp_us)
+{
+	uint32_t sequence = 0U;
+	return current_sense_read_three_phase_with_timestamp_and_sequence(
+		iu_a,
+		iv_a,
+		iw_a,
+		timestamp_us,
+		&sequence);
 }
 
 esp_err_t current_sense_read_three_phase(

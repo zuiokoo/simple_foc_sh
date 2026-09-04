@@ -14,11 +14,17 @@ typedef struct
 	float iu_a;                 // U相实际电流，单位 A
 	float iv_a;                 // V相实际电流，单位 A
 	float iw_a;                 // W相实际电流，单位 A
-	float electrical_angle_rad; // 转子电角度，单位 rad
+	float electrical_angle_rad;        // 电流采样时刻的转子电角度，单位 rad
+	float output_electrical_angle_rad; // 预计PWM生效时刻的电角度，单位 rad
 	float id_ref_a;             // d轴目标电流，单位 A
 	float iq_ref_a;             // q轴目标电流，单位 A
 	float dt_s;                 // 本次控制周期，单位 s
 	float bus_voltage_v;        // 直流母线电压，单位 V
+	float electrical_velocity_rad_s; // 电角速度，单位 rad/s
+	float motor_phase_resistance_ohm; // 电机相电阻，单位 ohm
+	float motor_inductance_d_h;      // d轴电感，单位 H
+	float motor_inductance_q_h;      // q轴电感，单位 H
+	float motor_flux_linkage_wb;     // 永磁体磁链，单位 Wb
 } foc_controller_input_t;
 
 /**
@@ -34,8 +40,11 @@ typedef struct
 	float i_q_a;           // Park变换后的q轴实际电流，单位 A
 	float id_error_a;      // d轴电流误差，单位 A
 	float iq_error_a;      // q轴电流误差，单位 A
-	float vd_v;            // d轴电压指令，单位 V
-	float vq_v;            // q轴电压指令，单位 V
+	float vd_v;            // d轴总电压指令，单位 V
+	float vq_v;            // q轴总电压指令，单位 V
+	float vd_decoupling_v; // d轴解耦/反电势前馈，单位 V
+	float vq_decoupling_v; // q轴解耦/反电势前馈，单位 V
+	float voltage_vector_limit_v; // dq电压矢量限幅，单位 V
 	float v_alpha_v;       // alpha轴电压指令，单位 V
 	float v_beta_v;        // beta轴电压指令，单位 V
 	float u_voltage_v;     // U相电压指令，单位 V

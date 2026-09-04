@@ -9,8 +9,13 @@
 
 #define AS5600_REG_RAW_ANGLE_H 0x0C
 #define AS5600_REG_RAW_ANGLE_L 0x0D
-#define AS5600_I2C_TIMEOUT_MS 100
-#define AS5600_VELOCITY_WINDOW_US 10000
+#define AS5600_I2C_TIMEOUT_MS 2
+/*
+ * The angle task samples AS5600 every 1 ms.  Update velocity at every
+ * sample, then filter it with a short time constant so delay compensation
+ * follows acceleration without turning encoder quantization into noise.
+ */
+#define AS5600_VELOCITY_FILTER_TAU_S 0.002f
 
 static const char *TAG = "AS5600";
 static i2c_master_bus_handle_t as5600_bus;
@@ -130,6 +135,8 @@ esp_err_t as5600_measure_angle_velocity(float *angle_rad, float *velocity_rad_s)
 	esp_err_t result = as5600_get_mechanical_angle(&current_angle_rad);
 	if (result != ESP_OK)
 	{
+		as5600_velocity_initialized = 0;
+		as5600_velocity_estimate_rad_s = 0.0f;
 		return result;
 	}
 	*angle_rad = current_angle_rad;
@@ -152,24 +159,26 @@ esp_err_t as5600_measure_angle_velocity(float *angle_rad, float *velocity_rad_s)
 		return ESP_ERR_INVALID_STATE;
 	}
 
-	if (delta_time_us >= AS5600_VELOCITY_WINDOW_US)
+	float delta_angle_rad =
+		current_angle_rad - as5600_velocity_reference_angle_rad;
+	if (delta_angle_rad > 3.14159265358979323846f)
 	{
-		float delta_angle_rad =
-			current_angle_rad - as5600_velocity_reference_angle_rad;
-		if (delta_angle_rad > 3.14159265358979323846f)
-		{
-			delta_angle_rad -= 2.0f * 3.14159265358979323846f;
-		}
-		else if (delta_angle_rad < -3.14159265358979323846f)
-		{
-			delta_angle_rad += 2.0f * 3.14159265358979323846f;
-		}
-
-		as5600_velocity_estimate_rad_s =
-			delta_angle_rad / ((float)delta_time_us / 1000000.0f);
-		as5600_velocity_reference_angle_rad = current_angle_rad;
-		as5600_velocity_reference_time_us = current_time_us;
+		delta_angle_rad -= 2.0f * 3.14159265358979323846f;
 	}
+	else if (delta_angle_rad < -3.14159265358979323846f)
+	{
+		delta_angle_rad += 2.0f * 3.14159265358979323846f;
+	}
+
+	float delta_time_s = (float)delta_time_us / 1000000.0f;
+	float instantaneous_velocity_rad_s = delta_angle_rad / delta_time_s;
+	float filter_alpha = delta_time_s /
+		(AS5600_VELOCITY_FILTER_TAU_S + delta_time_s);
+	as5600_velocity_estimate_rad_s +=
+		filter_alpha * (instantaneous_velocity_rad_s -
+			as5600_velocity_estimate_rad_s);
+	as5600_velocity_reference_angle_rad = current_angle_rad;
+	as5600_velocity_reference_time_us = current_time_us;
 
 	*velocity_rad_s = as5600_velocity_estimate_rad_s;
 	return ESP_OK;

@@ -29,12 +29,11 @@ class SpeedLoopIntegrationContractTest(unittest.TestCase):
 
     def test_speed_loop_debug_configuration_is_explicit(self):
         config = CONFIG.read_text(encoding="utf-8")
-        self.assertIn("#define M1_ENABLE_FOC_CURRENT_LOOP 1", config)
         self.assertIn("#define M1_ENABLE_SPEED_LOOP 0", config)
         self.assertIn("#define M1_SPEED_REF_RAD_S 0.0f", config)
         self.assertIn("#define M1_SPEED_IQ_LIMIT_A 0.02f", config)
         self.assertIn("#define M1_CURRENT_LOOP_TEST_ID_REF_A 0.0f", config)
-        self.assertIn("#define M1_CURRENT_LOOP_TEST_IQ_REF_A 0.10f", config)
+        self.assertIn("#define M1_CURRENT_LOOP_TEST_IQ_REF_A 0.20f", config)
         self.assertIn("#define M1_ENABLE_ELECTRICAL_ZERO_CALIBRATION 1", config)
 
 

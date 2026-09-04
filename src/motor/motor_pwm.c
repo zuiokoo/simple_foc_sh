@@ -4,6 +4,7 @@
 #include "driver/mcpwm_prelude.h"
 #include "esp_log.h"
 #include "esp_attr.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 // IDF 5.5 的 mcpwm prelude 驱动没有公开读取计数器的 API，
@@ -25,13 +26,13 @@ static bool pwm_initialized = false;
 static bool pwm_timer_enabled = false;
 static bool pwm_running = false;
 
-// The current loop is notified from the MCPWM empty event. One notification
+// The current loop is notified from the MCPWM full event. One notification
 // is emitted every M1_CURRENT_LOOP_PWM_PERIODS 20 kHz PWM periods.
 static TaskHandle_t s_control_task = NULL;
-static volatile uint32_t s_pwm_empty_events = 0;
-static volatile uint32_t s_control_tick_count = 0;
+static volatile uint32_t s_pwm_full_events = 0;
+static volatile uint32_t s_last_control_tick_timestamp_us = 0U;
 
-static bool IRAM_ATTR motor_pwm_on_empty(
+static bool IRAM_ATTR motor_pwm_on_full(
     mcpwm_timer_handle_t timer,
     const mcpwm_timer_event_data_t *edata,
     void *user_ctx)
@@ -40,15 +41,16 @@ static bool IRAM_ATTR motor_pwm_on_empty(
     (void)edata;
     (void)user_ctx;
 
-    s_pwm_empty_events++;
+    s_last_control_tick_timestamp_us = (uint32_t)esp_timer_get_time();
+
+    s_pwm_full_events++;
     if (s_control_task == NULL ||
-        (s_pwm_empty_events % M1_CURRENT_LOOP_PWM_PERIODS) != 0U)
+        (s_pwm_full_events % M1_CURRENT_LOOP_PWM_PERIODS) != 0U)
     {
         return false;
     }
 
     BaseType_t higher_priority_task_woken = pdFALSE;
-    s_control_tick_count++;
     vTaskNotifyGiveFromISR(s_control_task, &higher_priority_task_woken);
     return higher_priority_task_woken == pdTRUE;
 }
@@ -206,7 +208,8 @@ esp_err_t motor_pwm_init(void)
 	}
 
 		mcpwm_timer_event_callbacks_t timer_callbacks = {
-		.on_empty = motor_pwm_on_empty,
+		/* MCPWM_TIMER_EVENT_FULL is the center of up-down PWM. */
+        .on_full = motor_pwm_on_full,
 	};
 	result = mcpwm_timer_register_event_callbacks(pwm_timer, &timer_callbacks, NULL);
 	if (result != ESP_OK)
@@ -237,14 +240,15 @@ esp_err_t motor_pwm_register_control_task(TaskHandle_t task)
     }
 
     s_control_task = task;
-    s_pwm_empty_events = 0;
-    s_control_tick_count = 0;
+    s_pwm_full_events = 0;
+    s_last_control_tick_timestamp_us = 0U;
     return ESP_OK;
 }
 
-uint32_t motor_pwm_control_tick_count(void)
+
+uint32_t motor_pwm_get_control_tick_timestamp_us(void)
 {
-    return s_control_tick_count;
+    return s_last_control_tick_timestamp_us;
 }
 
 esp_err_t motor_pwm_start(void)

@@ -16,13 +16,12 @@ class CurrentSenseContractTest(unittest.TestCase):
         self.assertIn("typedef struct", header)
         self.assertIn("current_sense_frame_t", header)
         self.assertIn("current_sense_read_latest_frame", header)
-        self.assertIn("current_sense_dma_overflow_count", header)
         self.assertIn("adc_continuous_register_event_callbacks(", source)
         self.assertIn("on_conv_done", source)
         self.assertIn("on_pool_ovf", source)
-        self.assertIn("#define CURRENT_ADC_FRAME_SIZE_BYTES 40U", source)
+        self.assertIn("#define CURRENT_ADC_FRAME_SIZE_BYTES 32U", source)
         self.assertIn("sizeof(adc_digi_output_data_t)", source)
-        self.assertIn("xTaskCreate(", source)
+        self.assertIn("xTaskCreatePinnedToCore(", source)
         self.assertIn("ulTaskNotifyTake(pdTRUE, portMAX_DELAY)", source)
         self.assertNotIn("motor_pwm_wait_lowside_window", source)
         self.assertNotIn("motor_pwm_wait_count_rising", source)
@@ -38,14 +37,6 @@ class CurrentSenseContractTest(unittest.TestCase):
 
         self.assertIn("esp_err_t current_sense_init(void);", header)
         self.assertIn("esp_err_t current_sense_calibrate(void);", header)
-        self.assertIn(
-            "esp_err_t current_sense_read(int *iu_raw, int *iv_raw);",
-            header,
-        )
-        self.assertIn(
-            "esp_err_t current_sense_read_amperes(float *iu_a, float *iv_a);",
-            header,
-        )
         self.assertIn("esp_err_t current_sense_read_three_phase(", header)
         self.assertIn("float *iw_a);", header)
         self.assertNotIn("current_sense_read_corrected", header)
@@ -61,7 +52,6 @@ class CurrentSenseContractTest(unittest.TestCase):
         self.assertIn("ADC_CHANNEL_0", source)
         self.assertIn("ADC_CHANNEL_3", source)
         self.assertIn("current_sense_calibrate(void)", source)
-        self.assertIn("current_sense_read_amperes(", source)
         self.assertIn("current_sense_read_three_phase(", source)
         self.assertIn("*iw_a = -(*iu_a + *iv_a);", source)
         self.assertNotIn("current_sense_read_corrected", source)
@@ -80,14 +70,15 @@ class CurrentSenseContractTest(unittest.TestCase):
         self.assertIn("current_latest_iu_a", source)
         self.assertIn("current_latest_iv_a", source)
         self.assertIn("current_sense_raw_to_voltage(frame.iu_raw", source)
-        read_body = source.split("esp_err_t current_sense_read_amperes(", 1)[1]
-        read_body = read_body.split("esp_err_t current_sense_read_three_phase(", 1)[0]
-        self.assertNotIn("current_sense_raw_to_voltage(frame.iu_raw", read_body)
-    def test_classic_esp32_frame_is_20_results_for_10khz(self):
+        read_body = source.split("esp_err_t current_sense_read_three_phase_with_timestamp_and_sequence(", 1)[1]
+        self.assertIn("current_latest_iu_a", read_body)
+        self.assertIn("current_latest_iv_a", read_body)
+        self.assertNotIn("adc_continuous_read(", read_body)
+    def test_classic_esp32_frame_is_4_results_for_200khz(self):
         source = SOURCE.read_text(encoding="utf-8")
 
         self.assertIn("#define CURRENT_ADC_SAMPLE_FREQ_HZ 200000U", source)
-        self.assertIn("#define CURRENT_ADC_FRAME_SIZE_BYTES 40U", source)
+        self.assertIn("#define CURRENT_ADC_FRAME_SIZE_BYTES 32U", source)
         self.assertIn("#define CURRENT_ADC_MAX_STORE_BUF_SIZE_BYTES 4096U", source)
         self.assertNotIn("static const uint32_t current_adc_frame_size_bytes", source)
 
@@ -109,7 +100,7 @@ class CurrentSenseContractTest(unittest.TestCase):
         self.assertIn('#include "esp_timer.h"', main)
         self.assertIn("esp_timer_get_time()", main)
         self.assertIn("FOC_CURRENT_TS_S", main)
-        self.assertIn("controller_input.dt_s = FOC_CURRENT_TS_S;", main)
+        self.assertIn("controller_input.dt_s = control_dt_s;", main)
         self.assertIn("ulTaskNotifyTake(pdTRUE, portMAX_DELAY)", main)
         self.assertNotIn("current_sense_read_corrected", main)
 
@@ -121,6 +112,12 @@ class CurrentSenseContractTest(unittest.TestCase):
         self.assertIn("frame_duration_us", source)
         self.assertIn("frame_duration_us / 2", source)
         self.assertNotIn("20 results", source)
+    def test_frame_center_uses_measured_dma_cadence_when_available(self):
+        source = SOURCE.read_text(encoding="utf-8")
+
+        self.assertIn("current_adc_previous_frame_end_timestamp_us", source)
+        self.assertIn("measured_frame_duration_us", source)
+        self.assertIn("frame_end_timestamp_us - current_adc_previous_frame_end_timestamp_us", source)
     def test_current_frame_timestamp_is_returned_with_currents(self):
         header = HEADER.read_text(encoding="utf-8")
         source = SOURCE.read_text(encoding="utf-8")
@@ -129,5 +126,46 @@ class CurrentSenseContractTest(unittest.TestCase):
         self.assertIn("current_sense_read_three_phase_with_timestamp(", source)
         self.assertIn("current_latest_frame.timestamp_us", source)
 
+    def test_dma_frame_timestamp_comes_from_conversion_event(self):
+        source = SOURCE.read_text(encoding="utf-8")
+
+        self.assertIn("current_adc_last_conv_done_timestamp_us", source)
+        self.assertIn(
+            "current_adc_last_conv_done_timestamp_us = (uint32_t)esp_timer_get_time()",
+            source,
+        )
+        self.assertIn("current_sense_take_frame_timestamp()", source)
+        self.assertIn("int64_t frame_end_timestamp_us)", source)
+    def test_realtime_current_read_can_return_frame_sequence(self):
+        header = HEADER.read_text(encoding="utf-8")
+        source = SOURCE.read_text(encoding="utf-8")
+
+        self.assertIn(
+            "current_sense_read_three_phase_with_timestamp_and_sequence(",
+            header,
+        )
+        self.assertIn(
+            "current_sense_read_three_phase_with_timestamp_and_sequence(",
+            source,
+        )
+        self.assertIn("*sequence = current_latest_frame.sequence", source)
+
+    def test_current_consumer_can_select_frame_before_control_event(self):
+        header = HEADER.read_text(encoding="utf-8")
+        source = SOURCE.read_text(encoding="utf-8")
+
+        self.assertIn(
+            "current_sense_read_three_phase_at_or_before_timestamp(",
+            header,
+        )
+        self.assertIn(
+            "current_sense_read_three_phase_at_or_before_timestamp(",
+            source,
+        )
+        self.assertIn("current_frame_history", source)
+        self.assertIn("timestamp_us <= target_timestamp_us", source)
+        self.assertIn("selected_frame.iu_a", source)
+        self.assertIn("selected_frame.iv_a", source)
+        self.assertIn("xTaskCreatePinnedToCore", source)
 if __name__ == "__main__":
     unittest.main()
