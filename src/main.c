@@ -71,6 +71,7 @@ typedef struct
     uint32_t angle_age_us;
     uint32_t current_age_us;
     uint32_t current_valid;
+    uint32_t fault_code;
     uint32_t current_sequence;
     int32_t angle_to_current_sample_us;
     int32_t electrical_angle_mrad;
@@ -461,6 +462,7 @@ static void foc_current_telemetry_task(void *pvParameter)
         snapshot.angle_age_us = foc_current_snapshot.angle_age_us;
         snapshot.current_age_us = foc_current_snapshot.current_age_us;
         snapshot.current_valid = foc_current_snapshot.current_valid;
+        snapshot.fault_code = foc_current_snapshot.fault_code;
         snapshot.current_sequence = foc_current_snapshot.current_sequence;
         snapshot.angle_to_current_sample_us = foc_current_snapshot.angle_to_current_sample_us;
         snapshot.electrical_angle_mrad = foc_current_snapshot.electrical_angle_mrad;
@@ -481,7 +483,7 @@ static void foc_current_telemetry_task(void *pvParameter)
 		 */
 		ESP_LOGI(
 			"FOC_TELEM",
-			"dt_us=%ld period_us=%lu period_min_us=%lu period_max_us=%lu period_jitter_us=%lu speed_mrad_s=%ld angle_velocity_mrad_s=%ld angle_age_us=%lu current_age_us=%lu current_valid=%lu current_sequence=%lu angle_to_current_sample_us=%ld electrical_angle_mrad=%ld iq_ref_mA=%ld iu_mA=%ld iv_mA=%ld iw_mA=%ld id_mA=%ld iq_mA=%ld vd_mV=%ld vq_mV=%ld vd_dec_mV=%ld vq_dec_mV=%ld v_limit_mV=%ld id_pi_int_mV=%ld iq_pi_int_mV=%ld duty=%ld/%ld/%ld missed=%lu overrun=%lu max_loop_us=%lu angle_valid=%lu angle_err=%lu",
+			"dt_us=%ld period_us=%lu period_min_us=%lu period_max_us=%lu period_jitter_us=%lu speed_mrad_s=%ld angle_velocity_mrad_s=%ld angle_age_us=%lu current_age_us=%lu current_valid=%lu fault=%lu current_sequence=%lu angle_to_current_sample_us=%ld electrical_angle_mrad=%ld iq_ref_mA=%ld iu_mA=%ld iv_mA=%ld iw_mA=%ld id_mA=%ld iq_mA=%ld vd_mV=%ld vq_mV=%ld vd_dec_mV=%ld vq_dec_mV=%ld v_limit_mV=%ld id_pi_int_mV=%ld iq_pi_int_mV=%ld duty=%ld/%ld/%ld missed=%lu overrun=%lu max_loop_us=%lu angle_valid=%lu angle_err=%lu",
 			(long)(snapshot.dt_s * 1000000.0f),
             (unsigned long)snapshot.actual_period_us,
             (unsigned long)snapshot.period_min_us,
@@ -492,6 +494,7 @@ static void foc_current_telemetry_task(void *pvParameter)
             (unsigned long)snapshot.angle_age_us,
             (unsigned long)snapshot.current_age_us,
             (unsigned long)snapshot.current_valid,
+            (unsigned long)snapshot.fault_code,
             (unsigned long)snapshot.current_sequence,
             (long)snapshot.angle_to_current_sample_us,
             (long)snapshot.electrical_angle_mrad,
@@ -612,6 +615,21 @@ static void foc_angle_sensor_task(void *pvParameter)
             }
 
         }
+    }
+}
+static void foc_current_latch_fault(uint32_t fault_code)
+{
+    foc_current_snapshot.current_valid = 0U;
+    foc_current_snapshot.fault_code = fault_code;
+    foc_controller_reset(&foc_controller);
+    foc_speed_pi_reset(&foc_speed_controller);
+    motor_pwm_set_duty(0.5f, 0.5f, 0.5f);
+    motor_pwm_stop();
+
+    /* A reset is required after a latched current-control fault. */
+    while (true)
+    {
+        vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
 static void foc_current_task(void *pvParameter)
@@ -841,12 +859,7 @@ static void foc_current_task(void *pvParameter)
 				iv_a,
 				iw_a);
 
-			foc_controller_reset(&foc_controller);
-			foc_speed_pi_reset(&foc_speed_controller);
-			motor_pwm_set_duty(0.5f, 0.5f, 0.5f);
-			motor_pwm_stop();
-			vTaskDelete(NULL);
-			return;
+			foc_current_latch_fault(1U);
 		}
 
         float iq_target_a = iq_ref_a;
@@ -1044,9 +1057,7 @@ if ((loop_count % M1_CURRENT_TRACE_INTERVAL_LOOPS) == 0U)
 				"FOC current loop failed: %s",
 				esp_err_to_name(result));
 
-			motor_pwm_stop();
-			vTaskDelete(NULL);
-			return;
+			foc_current_latch_fault(2U);
 		}
 
 	}
