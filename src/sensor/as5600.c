@@ -9,7 +9,7 @@
 
 #define AS5600_REG_RAW_ANGLE_H 0x0C
 #define AS5600_REG_RAW_ANGLE_L 0x0D
-#define AS5600_I2C_TIMEOUT_MS 2
+#define AS5600_I2C_TIMEOUT_MS 100
 /*
  * The angle task samples AS5600 every 1 ms.  Update velocity at every
  * sample, then filter it with a short time constant so delay compensation
@@ -135,8 +135,6 @@ esp_err_t as5600_measure_angle_velocity(float *angle_rad, float *velocity_rad_s)
 	esp_err_t result = as5600_get_mechanical_angle(&current_angle_rad);
 	if (result != ESP_OK)
 	{
-		as5600_velocity_initialized = 0;
-		as5600_velocity_estimate_rad_s = 0.0f;
 		return result;
 	}
 	*angle_rad = current_angle_rad;

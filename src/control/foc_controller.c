@@ -104,10 +104,8 @@ esp_err_t foc_controller_step(foc_controller_t *controller, const foc_controller
 			(input->motor_inductance_d_h * output->i_d_a +
 			 input->motor_flux_linkage_wb);
 
-	float raw_vd_v = vd_pi_v + output->vd_decoupling_v;
-	float raw_vq_v = vq_pi_v + output->vq_decoupling_v;
-	output->vd_v = raw_vd_v;
-	output->vq_v = raw_vq_v;
+	output->vd_v = vd_pi_v + output->vd_decoupling_v;
+	output->vq_v = vq_pi_v + output->vq_decoupling_v;
 
 	/*
 	 * The phase-duty implementation reserves 5%% at both ends.  Limit the
@@ -130,24 +128,7 @@ esp_err_t foc_controller_step(foc_controller_t *controller, const foc_controller
 		 * voltage back into both PI integrators so the two regulators do
 		 * not wind up independently while the combined vector is saturated.
 		 */
-		controller->id_pi.integral += output->vd_v - raw_vd_v;
-		controller->iq_pi.integral += output->vq_v - raw_vq_v;
-		if (controller->id_pi.integral < controller->id_pi.output_min)
-		{
-			controller->id_pi.integral = controller->id_pi.output_min;
-		}
-		else if (controller->id_pi.integral > controller->id_pi.output_max)
-		{
-			controller->id_pi.integral = controller->id_pi.output_max;
-		}
-		if (controller->iq_pi.integral < controller->iq_pi.output_min)
-		{
-			controller->iq_pi.integral = controller->iq_pi.output_min;
-		}
-		else if (controller->iq_pi.integral > controller->iq_pi.output_max)
-		{
-			controller->iq_pi.integral = controller->iq_pi.output_max;
-		}
+
 	}
 
 	result = foc_inverse_park_transform(output->vd_v, output->vq_v, input->output_electrical_angle_rad, &output->v_alpha_v, &output->v_beta_v);

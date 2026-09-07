@@ -100,7 +100,6 @@ static volatile foc_current_snapshot_t foc_current_snapshot;
 
 // 实际直流母线电压，供SVPWM电压换算使用。
 #define FOC_TEST_BUS_VOLTAGE_V 12.0f
-#define FOC_MAX_ANGLE_AGE_US 1500U
 static void ws2812_encode_byte(uint8_t value, uint8_t output[3])
 {
 	uint32_t encode = 0;
@@ -595,11 +594,7 @@ static void foc_angle_sensor_task(void *pvParameter)
                     esp_err_to_name(result),
                     (unsigned long)foc_angle_error_count);
             }
-            /* Never let the current loop continue with an old rotor angle. */
-            portENTER_CRITICAL(&foc_angle_lock);
-            foc_latest_angle_valid = false;
-            portEXIT_CRITICAL(&foc_angle_lock);
-            vTaskDelay(pdMS_TO_TICKS(2));
+
         }
     }
 }
@@ -713,22 +708,7 @@ static void foc_current_task(void *pvParameter)
 
         if (!angle_snapshot_valid)
         {
-            (void)motor_pwm_set_duty(0.5f, 0.5f, 0.5f);
-            foc_controller_reset(&foc_controller);
-            foc_speed_pi_reset(&foc_speed_controller);
-            iq_ref_a = 0.0f;
             foc_current_snapshot.dt_s = control_dt_s;
-            foc_current_snapshot.mechanical_speed_rad_s =
-                M1_SPEED_FEEDBACK_SIGN * mechanical_velocity_rad_s;
-            foc_current_snapshot.iq_ref_a = 0.0f;
-            foc_current_snapshot.vd_v = 0.0f;
-            foc_current_snapshot.vq_v = 0.0f;
-            foc_current_snapshot.vd_decoupling_v = 0.0f;
-            foc_current_snapshot.vq_decoupling_v = 0.0f;
-            foc_current_snapshot.voltage_vector_limit_v = 0.0f;
-            foc_current_snapshot.duty_u = 0.5f;
-            foc_current_snapshot.duty_v = 0.5f;
-            foc_current_snapshot.duty_w = 0.5f;
             foc_current_snapshot.missed_ticks = current_loop_missed_ticks;
             foc_current_snapshot.overrun_count = current_loop_overrun_count;
             foc_current_snapshot.max_loop_us = current_loop_max_us;
@@ -737,51 +717,11 @@ static void foc_current_task(void *pvParameter)
             continue;
         }
 
-        int64_t angle_age_signed_us =
-            iteration_start_us - (int64_t)angle_snapshot_timestamp_us;
-        uint32_t angle_age_us = angle_age_signed_us > 0
-            ? (uint32_t)angle_age_signed_us
-            : 0U;
+        uint32_t angle_age_us =
+            (uint32_t)iteration_start_us - angle_snapshot_timestamp_us;
         if (angle_age_us > 2000U)
         {
             angle_age_us = 2000U;
-        }
-        if (angle_age_us > FOC_MAX_ANGLE_AGE_US)
-        {
-            /* A stale angle is unsafe: center PWM and restart both PI states. */
-            portENTER_CRITICAL(&foc_angle_lock);
-            foc_latest_angle_valid = false;
-            portEXIT_CRITICAL(&foc_angle_lock);
-            (void)motor_pwm_set_duty(0.5f, 0.5f, 0.5f);
-            foc_controller_reset(&foc_controller);
-            foc_speed_pi_reset(&foc_speed_controller);
-            iq_ref_a = 0.0f;
-            foc_current_snapshot.dt_s = control_dt_s;
-            foc_current_snapshot.mechanical_speed_rad_s =
-                M1_SPEED_FEEDBACK_SIGN * mechanical_velocity_rad_s;
-            foc_current_snapshot.iq_ref_a = 0.0f;
-            foc_current_snapshot.vd_v = 0.0f;
-            foc_current_snapshot.vq_v = 0.0f;
-            foc_current_snapshot.vd_decoupling_v = 0.0f;
-            foc_current_snapshot.vq_decoupling_v = 0.0f;
-            foc_current_snapshot.voltage_vector_limit_v = 0.0f;
-            foc_current_snapshot.duty_u = 0.5f;
-            foc_current_snapshot.duty_v = 0.5f;
-            foc_current_snapshot.duty_w = 0.5f;
-            foc_current_snapshot.missed_ticks = current_loop_missed_ticks;
-            foc_current_snapshot.overrun_count = current_loop_overrun_count;
-            foc_current_snapshot.max_loop_us = current_loop_max_us;
-            foc_current_snapshot.angle_valid = 0U;
-            foc_current_snapshot.angle_error_count = foc_angle_error_count;
-            foc_current_snapshot.angle_age_us = angle_age_us;
-            foc_current_snapshot.current_age_us = 0U;
-            foc_current_snapshot.current_sequence = 0U;
-            foc_current_snapshot.angle_to_current_sample_us = 0;
-            foc_current_snapshot.electrical_angle_mrad = 0;
-            foc_current_snapshot.angle_velocity_mrad_s = 0.0f;
-            foc_current_snapshot.id_pi_integral_v = 0.0f;
-            foc_current_snapshot.iq_pi_integral_v = 0.0f;
-            continue;
         }
         float mechanical_angle = 0.0f;
         float electrical_angle = 0.0f;

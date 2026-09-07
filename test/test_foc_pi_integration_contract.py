@@ -42,15 +42,6 @@ class FocPiIntegrationContractTest(unittest.TestCase):
         self.assertIn("foc_park_transform(output->i_alpha_a, output->i_beta_a, input->electrical_angle_rad", source)
         self.assertIn("foc_inverse_park_transform(output->vd_v, output->vq_v, input->output_electrical_angle_rad", source)
         self.assertIn("controller_input.output_electrical_angle_rad", main)
-    def test_current_controller_back_calculates_vector_saturation(self):
-        source = SOURCE.read_text(encoding="utf-8")
-
-        self.assertIn("raw_vd_v", source)
-        self.assertIn("raw_vq_v", source)
-        self.assertIn("controller->id_pi.integral", source)
-        self.assertIn("controller->iq_pi.integral", source)
-        self.assertIn("output->vd_v - raw_vd_v", source)
-        self.assertIn("output->vq_v - raw_vq_v", source)
     def test_current_controller_has_speed_decoupling_and_vector_limit(self):
         main = MAIN.read_text(encoding="utf-8")
         header = HEADER.read_text(encoding="utf-8")

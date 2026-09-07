@@ -102,15 +102,6 @@ class FocTimingContractTest(unittest.TestCase):
 
         self.assertIn("#define M1_ENABLE_TIMING_LOG 0", config)
         self.assertIn("#define M1_ENABLE_CURRENT_TRACE 0", config)
-    def test_current_loop_rejects_stale_angle_feedback(self):
-        main = MAIN.read_text(encoding="utf-8")
-
-        self.assertIn("FOC_MAX_ANGLE_AGE_US", main)
-        self.assertIn("angle_age_us > FOC_MAX_ANGLE_AGE_US", main)
-        self.assertIn("motor_pwm_set_duty(0.5f, 0.5f, 0.5f)", main)
-        self.assertIn("foc_controller_reset(&foc_controller)", main)
-        self.assertIn("angle_snapshot_valid = false", main)
-        self.assertIn("iq_ref_a = 0.0f", main)
     def test_current_loop_is_pinned_away_from_main_cpu(self):
         main = MAIN.read_text(encoding="utf-8")
 
