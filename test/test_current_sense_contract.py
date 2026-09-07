@@ -131,7 +131,7 @@ class CurrentSenseContractTest(unittest.TestCase):
 
         self.assertIn("current_adc_last_conv_done_timestamp_us", source)
         self.assertIn(
-            "current_adc_last_conv_done_timestamp_us = (uint32_t)esp_timer_get_time()",
+            "current_adc_last_conv_done_timestamp_us = esp_timer_get_time()",
             source,
         )
         self.assertIn("current_sense_take_frame_timestamp()", source)

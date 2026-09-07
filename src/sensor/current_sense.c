@@ -44,7 +44,7 @@ static portMUX_TYPE current_frame_lock = portMUX_INITIALIZER_UNLOCKED;
 static current_sense_frame_t current_latest_frame = {0};
 static bool current_frame_valid = false;
 static uint32_t current_frame_sequence = 0;
-static volatile uint32_t current_adc_last_conv_done_timestamp_us = 0U;
+static volatile int64_t current_adc_last_conv_done_timestamp_us = 0;
 static int64_t current_adc_previous_frame_end_timestamp_us = 0;
 enum { CURRENT_ADC_TIMESTAMP_RING_SIZE = 64 };
 enum { CURRENT_FRAME_HISTORY_SIZE = 16 };
@@ -88,7 +88,7 @@ static bool IRAM_ATTR current_sense_on_conv_done(
 	(void)handle;
 	(void)edata;
 	(void)user_data;
-	current_adc_last_conv_done_timestamp_us = (uint32_t)esp_timer_get_time();
+	current_adc_last_conv_done_timestamp_us = esp_timer_get_time();
 	int64_t conversion_timestamp_us = current_adc_last_conv_done_timestamp_us;
 	portENTER_CRITICAL_ISR(&current_adc_timestamp_lock);
 	if (current_adc_timestamp_count < CURRENT_ADC_TIMESTAMP_RING_SIZE)
@@ -420,7 +420,7 @@ esp_err_t current_sense_init(void)
         CURRENT_ADC_TASK_STACK_WORDS,
 				 NULL,
         CURRENT_ADC_TASK_PRIORITY,
-				 &current_adc_task_handle, 1) == pdPASS
+				 &current_adc_task_handle, 0) == pdPASS
 				 ? ESP_OK
 				 : ESP_ERR_NO_MEM;
 	if (result != ESP_OK)

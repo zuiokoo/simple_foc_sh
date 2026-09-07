@@ -70,6 +70,7 @@ typedef struct
 	uint32_t angle_error_count;
     uint32_t angle_age_us;
     uint32_t current_age_us;
+    uint32_t current_valid;
     uint32_t current_sequence;
     int32_t angle_to_current_sample_us;
     int32_t electrical_angle_mrad;
@@ -100,6 +101,7 @@ static volatile foc_current_snapshot_t foc_current_snapshot;
 #define FOC_TEST_PI_OUTPUT_MAX_V (6.0f)
 #define FOC_TEST_CURRENT_LIMIT_A 2.0f
 #define FOC_MAX_ANGLE_AGE_US 1500U
+#define FOC_MAX_CURRENT_AGE_US 1000U
 
 // 实际直流母线电压，供SVPWM电压换算使用。
 #define FOC_TEST_BUS_VOLTAGE_V 12.0f
@@ -458,6 +460,7 @@ static void foc_current_telemetry_task(void *pvParameter)
 	snapshot.angle_error_count = foc_current_snapshot.angle_error_count;
         snapshot.angle_age_us = foc_current_snapshot.angle_age_us;
         snapshot.current_age_us = foc_current_snapshot.current_age_us;
+        snapshot.current_valid = foc_current_snapshot.current_valid;
         snapshot.current_sequence = foc_current_snapshot.current_sequence;
         snapshot.angle_to_current_sample_us = foc_current_snapshot.angle_to_current_sample_us;
         snapshot.electrical_angle_mrad = foc_current_snapshot.electrical_angle_mrad;
@@ -478,7 +481,7 @@ static void foc_current_telemetry_task(void *pvParameter)
 		 */
 		ESP_LOGI(
 			"FOC_TELEM",
-			"dt_us=%ld period_us=%lu period_min_us=%lu period_max_us=%lu period_jitter_us=%lu speed_mrad_s=%ld angle_velocity_mrad_s=%ld angle_age_us=%lu current_age_us=%lu current_sequence=%lu angle_to_current_sample_us=%ld electrical_angle_mrad=%ld iq_ref_mA=%ld iu_mA=%ld iv_mA=%ld iw_mA=%ld id_mA=%ld iq_mA=%ld vd_mV=%ld vq_mV=%ld vd_dec_mV=%ld vq_dec_mV=%ld v_limit_mV=%ld id_pi_int_mV=%ld iq_pi_int_mV=%ld duty=%ld/%ld/%ld missed=%lu overrun=%lu max_loop_us=%lu angle_valid=%lu angle_err=%lu",
+			"dt_us=%ld period_us=%lu period_min_us=%lu period_max_us=%lu period_jitter_us=%lu speed_mrad_s=%ld angle_velocity_mrad_s=%ld angle_age_us=%lu current_age_us=%lu current_valid=%lu current_sequence=%lu angle_to_current_sample_us=%ld electrical_angle_mrad=%ld iq_ref_mA=%ld iu_mA=%ld iv_mA=%ld iw_mA=%ld id_mA=%ld iq_mA=%ld vd_mV=%ld vq_mV=%ld vd_dec_mV=%ld vq_dec_mV=%ld v_limit_mV=%ld id_pi_int_mV=%ld iq_pi_int_mV=%ld duty=%ld/%ld/%ld missed=%lu overrun=%lu max_loop_us=%lu angle_valid=%lu angle_err=%lu",
 			(long)(snapshot.dt_s * 1000000.0f),
             (unsigned long)snapshot.actual_period_us,
             (unsigned long)snapshot.period_min_us,
@@ -488,6 +491,7 @@ static void foc_current_telemetry_task(void *pvParameter)
             (long)(snapshot.angle_velocity_mrad_s),
             (unsigned long)snapshot.angle_age_us,
             (unsigned long)snapshot.current_age_us,
+            (unsigned long)snapshot.current_valid,
             (unsigned long)snapshot.current_sequence,
             (long)snapshot.angle_to_current_sample_us,
             (long)snapshot.electrical_angle_mrad,
@@ -737,6 +741,7 @@ static void foc_current_task(void *pvParameter)
             foc_current_snapshot.overrun_count = current_loop_overrun_count;
             foc_current_snapshot.max_loop_us = current_loop_max_us;
             foc_current_snapshot.angle_valid = 0U;
+            foc_current_snapshot.current_valid = 0U;
             foc_current_snapshot.angle_age_us = angle_age_us;
             foc_current_snapshot.angle_error_count = foc_angle_error_count;
             continue;
@@ -801,6 +806,23 @@ static void foc_current_task(void *pvParameter)
                     current_age_us = (uint32_t)(iteration_start_us - current_sample_timestamp_us);
                 }
             }
+        }
+        if (result == ESP_OK && current_age_us > FOC_MAX_CURRENT_AGE_US)
+        {
+            /* Never regulate from a millisecond-old ADC frame. */
+            foc_controller_reset(&foc_controller);
+            foc_speed_pi_reset(&foc_speed_controller);
+            motor_pwm_set_duty(0.5f, 0.5f, 0.5f);
+            foc_current_snapshot.dt_s = control_dt_s;
+            foc_current_snapshot.current_age_us = current_age_us;
+            foc_current_snapshot.current_sequence = current_sequence;
+            foc_current_snapshot.current_valid = 0U;
+            foc_current_snapshot.angle_valid = 1U;
+            foc_current_snapshot.angle_age_us = angle_age_us;
+            foc_current_snapshot.missed_ticks = current_loop_missed_ticks;
+            foc_current_snapshot.overrun_count = current_loop_overrun_count;
+            foc_current_snapshot.max_loop_us = current_loop_max_us;
+            continue;
         }
 		/*
 		 * Independent bench-test protection: stop before a bad feedback
@@ -946,6 +968,7 @@ static void foc_current_task(void *pvParameter)
 			foc_current_snapshot.overrun_count = current_loop_overrun_count;
 			foc_current_snapshot.max_loop_us = current_loop_max_us;
 			foc_current_snapshot.angle_valid = angle_snapshot_valid ? 1U : 0U;
+			foc_current_snapshot.current_valid = 1U;
 			foc_current_snapshot.angle_error_count = foc_angle_error_count;
             foc_current_snapshot.angle_age_us = angle_age_us;
             foc_current_snapshot.current_age_us = current_age_us;
