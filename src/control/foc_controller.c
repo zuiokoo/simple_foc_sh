@@ -119,18 +119,38 @@ esp_err_t foc_controller_step(foc_controller_t *controller, const foc_controller
 	if (voltage_magnitude_v > output->voltage_vector_limit_v &&
 		voltage_magnitude_v > 0.0f)
 	{
+		float vd_unlimited_v = output->vd_v;
+		float vq_unlimited_v = output->vq_v;
 		float scale = output->voltage_vector_limit_v / voltage_magnitude_v;
 		output->vd_v *= scale;
 		output->vq_v *= scale;
 
 		/*
-		 * The final dq vector is the actuator limit.  Feed the rejected
-		 * voltage back into both PI integrators so the two regulators do
-		 * not wind up independently while the combined vector is saturated.
+		 * Vector saturation is shared by d and q.  Back-calculate the
+		 * rejected vector into both PI integrators; otherwise one axis can
+		 * keep winding up while the other axis consumes the voltage limit.
 		 */
-
+		float vd_rejected_v = output->vd_v - vd_unlimited_v;
+		float vq_rejected_v = output->vq_v - vq_unlimited_v;
+		controller->id_pi.integral += vd_rejected_v;
+		controller->iq_pi.integral += vq_rejected_v;
+		if (controller->id_pi.integral < controller->id_pi.output_min)
+		{
+			controller->id_pi.integral = controller->id_pi.output_min;
+		}
+		else if (controller->id_pi.integral > controller->id_pi.output_max)
+		{
+			controller->id_pi.integral = controller->id_pi.output_max;
+		}
+		if (controller->iq_pi.integral < controller->iq_pi.output_min)
+		{
+			controller->iq_pi.integral = controller->iq_pi.output_min;
+		}
+		else if (controller->iq_pi.integral > controller->iq_pi.output_max)
+		{
+			controller->iq_pi.integral = controller->iq_pi.output_max;
+		}
 	}
-
 	result = foc_inverse_park_transform(output->vd_v, output->vq_v, input->output_electrical_angle_rad, &output->v_alpha_v, &output->v_beta_v);
 	if (result != ESP_OK)
 	{

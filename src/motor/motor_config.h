@@ -44,6 +44,8 @@
 #define M1_MOTOR_INDUCTANCE_D_H 0.019f
 #define M1_MOTOR_INDUCTANCE_Q_H 0.019f
 #define M1_MOTOR_FLUX_LINKAGE_WB 0.00053f
+/* Enable only after the measured electrical model is validated on the bench. */
+#define M1_ENABLE_DQ_DECOUPLING 0
 // 电角度零点校准默认关闭，避免每次上电都给电机通电。
 #define M1_ENABLE_ELECTRICAL_ZERO_CALIBRATION 1
 
