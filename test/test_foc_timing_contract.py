@@ -129,10 +129,11 @@ class FocTimingContractTest(unittest.TestCase):
         self.assertIn(".on_full = motor_pwm_on_full", source)
         self.assertIn("motor_pwm_get_control_tick_timestamp_us", header)
 
-    def test_current_loop_selects_newest_completed_sample_at_iteration_start(self):
+    def test_current_loop_anchors_sample_selection_to_pwm_event(self):
         main = MAIN.read_text(encoding="utf-8")
 
-        self.assertIn("int64_t current_target_timestamp_us = iteration_start_us;", main)
+        self.assertIn("motor_pwm_get_control_tick_timestamp_us()", main)
+        self.assertIn("current_target_timestamp_us = iteration_start_us;", main)
         self.assertIn("current_target_timestamp_us,", main)
 if __name__ == "__main__":
     unittest.main()

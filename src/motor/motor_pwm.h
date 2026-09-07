@@ -32,7 +32,7 @@ esp_err_t motor_pwm_stop(void);
 esp_err_t motor_pwm_register_control_task(TaskHandle_t task);
 
 /* Timestamp of the latest PWM center event that generated a control tick. */
-uint32_t motor_pwm_get_control_tick_timestamp_us(void);
+int64_t motor_pwm_get_control_tick_timestamp_us(void);
 
 #ifdef __cplusplus
 }

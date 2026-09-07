@@ -6,6 +6,7 @@
 #include "esp_attr.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/portmacro.h"
 #include "freertos/task.h"
 // IDF 5.5 的 mcpwm prelude 驱动没有公开读取计数器的 API，
 // 同步采样只能通过 HAL/LL 层直接读 MCPWM0 的计数器。
@@ -30,7 +31,8 @@ static bool pwm_running = false;
 // is emitted every M1_CURRENT_LOOP_PWM_PERIODS 20 kHz PWM periods.
 static TaskHandle_t s_control_task = NULL;
 static volatile uint32_t s_pwm_full_events = 0;
-static volatile uint32_t s_last_control_tick_timestamp_us = 0U;
+static portMUX_TYPE s_pwm_timestamp_lock = portMUX_INITIALIZER_UNLOCKED;
+static volatile int64_t s_last_control_tick_timestamp_us = 0;
 
 static bool IRAM_ATTR motor_pwm_on_full(
     mcpwm_timer_handle_t timer,
@@ -41,7 +43,10 @@ static bool IRAM_ATTR motor_pwm_on_full(
     (void)edata;
     (void)user_ctx;
 
-    s_last_control_tick_timestamp_us = (uint32_t)esp_timer_get_time();
+    int64_t timestamp_us = esp_timer_get_time();
+    portENTER_CRITICAL_ISR(&s_pwm_timestamp_lock);
+    s_last_control_tick_timestamp_us = timestamp_us;
+    portEXIT_CRITICAL_ISR(&s_pwm_timestamp_lock);
 
     s_pwm_full_events++;
     if (s_control_task == NULL ||
@@ -241,14 +246,20 @@ esp_err_t motor_pwm_register_control_task(TaskHandle_t task)
 
     s_control_task = task;
     s_pwm_full_events = 0;
-    s_last_control_tick_timestamp_us = 0U;
+    portENTER_CRITICAL(&s_pwm_timestamp_lock);
+    s_last_control_tick_timestamp_us = 0;
+    portEXIT_CRITICAL(&s_pwm_timestamp_lock);
     return ESP_OK;
 }
 
 
-uint32_t motor_pwm_get_control_tick_timestamp_us(void)
+int64_t motor_pwm_get_control_tick_timestamp_us(void)
 {
-    return s_last_control_tick_timestamp_us;
+    int64_t timestamp_us;
+    portENTER_CRITICAL(&s_pwm_timestamp_lock);
+    timestamp_us = s_last_control_tick_timestamp_us;
+    portEXIT_CRITICAL(&s_pwm_timestamp_lock);
+    return timestamp_us;
 }
 
 esp_err_t motor_pwm_start(void)

@@ -22,7 +22,7 @@ class FocFaultLatchContractTests(unittest.TestCase):
         self.assertIn("motor_pwm_stop();", latch)
         self.assertIn("while (true)", latch)
         self.assertIn("vTaskDelay(pdMS_TO_TICKS(1000));", latch)
-        self.assertIn('current_valid=%lu fault=%lu current_sequence=%lu', MAIN)
+        self.assertIn('current_valid=%lu angle_stale=%lu current_stale=%lu fault=%lu current_sequence=%lu', MAIN)
 
 
 if __name__ == "__main__":

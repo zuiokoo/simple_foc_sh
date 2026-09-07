@@ -55,6 +55,8 @@ typedef struct
 	float iw_a;
 	float id_a;
 	float iq_a;
+    float id_error_a;
+    float iq_error_a;
 	float vd_v;
 	float vq_v;
 	float vd_decoupling_v;
@@ -71,6 +73,8 @@ typedef struct
     uint32_t angle_age_us;
     uint32_t current_age_us;
     uint32_t current_valid;
+    uint32_t angle_stale_count;
+    uint32_t current_stale_count;
     uint32_t fault_code;
     uint32_t current_sequence;
     int32_t angle_to_current_sample_us;
@@ -101,7 +105,7 @@ static volatile foc_current_snapshot_t foc_current_snapshot;
 #define FOC_TEST_PI_OUTPUT_MIN_V (-6.0f)
 #define FOC_TEST_PI_OUTPUT_MAX_V (6.0f)
 #define FOC_TEST_CURRENT_LIMIT_A 2.0f
-#define FOC_MAX_ANGLE_AGE_US 1500U
+#define FOC_MAX_ANGLE_AGE_US 5000U
 #define FOC_MAX_CURRENT_AGE_US 1000U
 
 // 实际直流母线电压，供SVPWM电压换算使用。
@@ -446,6 +450,8 @@ static void foc_current_telemetry_task(void *pvParameter)
 		snapshot.iw_a = foc_current_snapshot.iw_a;
 		snapshot.id_a = foc_current_snapshot.id_a;
 		snapshot.iq_a = foc_current_snapshot.iq_a;
+        snapshot.id_error_a = foc_current_snapshot.id_error_a;
+        snapshot.iq_error_a = foc_current_snapshot.iq_error_a;
 		snapshot.vd_v = foc_current_snapshot.vd_v;
 		snapshot.vq_v = foc_current_snapshot.vq_v;
 		snapshot.vd_decoupling_v = foc_current_snapshot.vd_decoupling_v;
@@ -462,6 +468,8 @@ static void foc_current_telemetry_task(void *pvParameter)
         snapshot.angle_age_us = foc_current_snapshot.angle_age_us;
         snapshot.current_age_us = foc_current_snapshot.current_age_us;
         snapshot.current_valid = foc_current_snapshot.current_valid;
+        snapshot.angle_stale_count = foc_current_snapshot.angle_stale_count;
+        snapshot.current_stale_count = foc_current_snapshot.current_stale_count;
         snapshot.fault_code = foc_current_snapshot.fault_code;
         snapshot.current_sequence = foc_current_snapshot.current_sequence;
         snapshot.angle_to_current_sample_us = foc_current_snapshot.angle_to_current_sample_us;
@@ -483,7 +491,7 @@ static void foc_current_telemetry_task(void *pvParameter)
 		 */
 		ESP_LOGI(
 			"FOC_TELEM",
-			"dt_us=%ld period_us=%lu period_min_us=%lu period_max_us=%lu period_jitter_us=%lu speed_mrad_s=%ld angle_velocity_mrad_s=%ld angle_age_us=%lu current_age_us=%lu current_valid=%lu fault=%lu current_sequence=%lu angle_to_current_sample_us=%ld electrical_angle_mrad=%ld iq_ref_mA=%ld iu_mA=%ld iv_mA=%ld iw_mA=%ld id_mA=%ld iq_mA=%ld vd_mV=%ld vq_mV=%ld vd_dec_mV=%ld vq_dec_mV=%ld v_limit_mV=%ld id_pi_int_mV=%ld iq_pi_int_mV=%ld duty=%ld/%ld/%ld missed=%lu overrun=%lu max_loop_us=%lu angle_valid=%lu angle_err=%lu",
+			"dt_us=%ld period_us=%lu period_min_us=%lu period_max_us=%lu period_jitter_us=%lu speed_mrad_s=%ld angle_velocity_mrad_s=%ld angle_age_us=%lu current_age_us=%lu current_valid=%lu angle_stale=%lu current_stale=%lu fault=%lu current_sequence=%lu angle_to_current_sample_us=%ld electrical_angle_mrad=%ld iq_ref_mA=%ld iu_mA=%ld iv_mA=%ld iw_mA=%ld id_mA=%ld iq_mA=%ld id_err_mA=%ld iq_err_mA=%ld vd_mV=%ld vq_mV=%ld vd_dec_mV=%ld vq_dec_mV=%ld v_limit_mV=%ld id_pi_int_mV=%ld iq_pi_int_mV=%ld duty=%ld/%ld/%ld missed=%lu overrun=%lu max_loop_us=%lu angle_valid=%lu angle_err=%lu",
 			(long)(snapshot.dt_s * 1000000.0f),
             (unsigned long)snapshot.actual_period_us,
             (unsigned long)snapshot.period_min_us,
@@ -494,6 +502,8 @@ static void foc_current_telemetry_task(void *pvParameter)
             (unsigned long)snapshot.angle_age_us,
             (unsigned long)snapshot.current_age_us,
             (unsigned long)snapshot.current_valid,
+            (unsigned long)snapshot.angle_stale_count,
+            (unsigned long)snapshot.current_stale_count,
             (unsigned long)snapshot.fault_code,
             (unsigned long)snapshot.current_sequence,
             (long)snapshot.angle_to_current_sample_us,
@@ -504,6 +514,8 @@ static void foc_current_telemetry_task(void *pvParameter)
 			(long)(snapshot.iw_a * 1000.0f),
 			(long)(snapshot.id_a * 1000.0f),
 			(long)(snapshot.iq_a * 1000.0f),
+            (long)(snapshot.id_error_a * 1000.0f),
+            (long)(snapshot.iq_error_a * 1000.0f),
 						(long)(snapshot.vd_v * 1000.0f),
 			(long)(snapshot.vq_v * 1000.0f),
 			(long)(snapshot.vd_decoupling_v * 1000.0f),
@@ -681,6 +693,8 @@ static void foc_current_task(void *pvParameter)
 	uint32_t current_loop_missed_ticks = 0U;
 	uint32_t current_loop_overrun_count = 0U;
 	uint32_t current_loop_max_us = 0U;
+    uint32_t angle_stale_count = 0U;
+    uint32_t current_stale_count = 0U;
 	float iq_ref_a = 0.0f;
 #if M1_ENABLE_SPEED_LOOP
 	float speed_loop_elapsed_s = 0.0f;
@@ -697,7 +711,13 @@ static void foc_current_task(void *pvParameter)
 		loop_count++;
 		int64_t iteration_start_us = esp_timer_get_time();
         /* The PWM event wakes this task; use the newest ADC frame already complete at loop entry. */
-        int64_t current_target_timestamp_us = iteration_start_us;
+        int64_t current_target_timestamp_us =
+            motor_pwm_get_control_tick_timestamp_us();
+        if (current_target_timestamp_us <= 0 ||
+            current_target_timestamp_us > iteration_start_us)
+        {
+            current_target_timestamp_us = iteration_start_us;
+        }
         if (previous_iteration_start_us != 0 &&
             iteration_start_us >= previous_iteration_start_us)
         {
@@ -751,6 +771,7 @@ static void foc_current_task(void *pvParameter)
         }
         if (!angle_snapshot_valid || angle_age_us > FOC_MAX_ANGLE_AGE_US)
         {
+            angle_stale_count++;
             foc_controller_reset(&foc_controller);
             foc_speed_pi_reset(&foc_speed_controller);
             motor_pwm_set_duty(0.5f, 0.5f, 0.5f);
@@ -758,6 +779,8 @@ static void foc_current_task(void *pvParameter)
             foc_current_snapshot.missed_ticks = current_loop_missed_ticks;
             foc_current_snapshot.overrun_count = current_loop_overrun_count;
             foc_current_snapshot.max_loop_us = current_loop_max_us;
+            foc_current_snapshot.angle_stale_count = angle_stale_count;
+            foc_current_snapshot.current_stale_count = current_stale_count;
             foc_current_snapshot.angle_valid = 0U;
             foc_current_snapshot.current_valid = 0U;
             foc_current_snapshot.angle_age_us = angle_age_us;
@@ -827,6 +850,7 @@ static void foc_current_task(void *pvParameter)
         }
         if (result == ESP_OK && current_age_us > FOC_MAX_CURRENT_AGE_US)
         {
+            current_stale_count++;
             /* Never regulate from a millisecond-old ADC frame. */
             foc_controller_reset(&foc_controller);
             foc_speed_pi_reset(&foc_speed_controller);
@@ -966,6 +990,8 @@ static void foc_current_task(void *pvParameter)
 			foc_current_snapshot.iw_a = iw_a;
 			foc_current_snapshot.id_a = controller_output.i_d_a;
 			foc_current_snapshot.iq_a = controller_output.i_q_a;
+            foc_current_snapshot.id_error_a = controller_output.id_error_a;
+            foc_current_snapshot.iq_error_a = controller_output.iq_error_a;
 			foc_current_snapshot.vd_v = controller_output.vd_v;
 			foc_current_snapshot.vq_v = controller_output.vq_v;
 			foc_current_snapshot.vd_decoupling_v =
@@ -980,6 +1006,8 @@ static void foc_current_task(void *pvParameter)
 			foc_current_snapshot.missed_ticks = current_loop_missed_ticks;
 			foc_current_snapshot.overrun_count = current_loop_overrun_count;
 			foc_current_snapshot.max_loop_us = current_loop_max_us;
+            foc_current_snapshot.angle_stale_count = angle_stale_count;
+            foc_current_snapshot.current_stale_count = current_stale_count;
 			foc_current_snapshot.angle_valid = angle_snapshot_valid ? 1U : 0U;
 			foc_current_snapshot.current_valid = 1U;
 			foc_current_snapshot.angle_error_count = foc_angle_error_count;
