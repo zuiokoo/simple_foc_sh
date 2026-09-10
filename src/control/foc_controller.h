@@ -1,6 +1,8 @@
 #ifndef FOC_CONTROLLER_H
 #define FOC_CONTROLLER_H
 
+#include <stdbool.h>
+
 #include "esp_err.h"
 #include "foc_pi.h"
 
@@ -16,8 +18,8 @@ typedef struct
 	float iw_a;                 // W相实际电流，单位 A
 	float electrical_angle_rad;        // 电流采样时刻的转子电角度，单位 rad
 	float output_electrical_angle_rad; // 预计PWM生效时刻的电角度，单位 rad
-	float id_ref_a;             // d轴目标电流，单位 A
-	float iq_ref_a;             // q轴目标电流，单位 A
+	float id_target_a;             // d轴目标电流，单位 A
+	float iq_target_a;             // q轴目标电流，单位 A
 	float dt_s;                 // 本次控制周期，单位 s
 	float bus_voltage_v;        // 直流母线电压，单位 V
 	float electrical_velocity_rad_s; // 电角速度，单位 rad/s
@@ -64,6 +66,7 @@ typedef struct
 {
 	foc_pi_controller_t id_pi;
 	foc_pi_controller_t iq_pi;
+	bool id_loop_enabled;
 } foc_controller_t;
 
 /**
@@ -85,6 +88,23 @@ void foc_controller_init(
  */
 void foc_controller_reset(
 	foc_controller_t *controller);
+/**
+ * @brief Enable or disable the d-axis current PI loop.
+ *
+ * The measured d-axis current remains available in the step output even when
+ * this loop is disabled. When disabled, the d-axis PI is reset and does not
+ * contribute voltage to the controller output.
+ */
+void foc_controller_set_id_loop_enabled(
+    foc_controller_t *controller,
+    bool enabled);
+
+void foc_controller_set_pi_gains(
+    foc_controller_t *controller,
+    float id_kp,
+    float id_ki,
+    float iq_kp,
+    float iq_ki);
 
 /**
  * @brief 执行一次完整的 FOC 数学计算。

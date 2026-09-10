@@ -21,12 +21,11 @@
 /*
  * ADC1 runs at 200 kHz.  On the classic ESP32 one logical DMA result is
  * sizeof(adc_digi_output_data_t) bytes: 12 bits of data plus 4 bits of
- * channel information.  A 32-byte frame contains 8 results (about 4 U
- * samples and 4 V samples), balancing latency and switching-ripple averaging.
+ * channel information.  A 80-byte frame contains 20 results (about 10 U samples and 10 V samples), spanning 2 complete 20 kHz PWM periods.
  */
 #define CURRENT_SENSE_CALIBRATION_SAMPLES 100
 #define CURRENT_ADC_SAMPLE_FREQ_HZ 200000U
-#define CURRENT_ADC_FRAME_SIZE_BYTES 32U
+#define CURRENT_ADC_FRAME_SIZE_BYTES 80U
 #define CURRENT_ADC_MAX_STORE_BUF_SIZE_BYTES 4096U
 #define CURRENT_ADC_TASK_STACK_WORDS 3072U
 #define CURRENT_ADC_TASK_PRIORITY 8U
@@ -274,46 +273,46 @@ if (current_frame_history_count < CURRENT_FRAME_HISTORY_SIZE)
 
 static void current_sense_dma_task(void *pv_parameter)
 {
-	(void)pv_parameter;
+    (void)pv_parameter;
 
     uint8_t frame_buffer[CURRENT_ADC_FRAME_SIZE_BYTES];
 
-	while (1)
-	{
-		ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    while (1)
+    {
+        /* One notification represents one complete DMA frame. */
+        ulTaskNotifyTake(pdFALSE, portMAX_DELAY);
 
-		while (1)
-		{
-			uint32_t bytes_read = 0U;
-			esp_err_t result = adc_continuous_read(
-				current_adc_handle,
-				frame_buffer,
-				sizeof(frame_buffer),
-				&bytes_read,
-				0);
+        uint32_t bytes_read = 0U;
+        esp_err_t result = adc_continuous_read(
+            current_adc_handle,
+            frame_buffer,
+            sizeof(frame_buffer),
+            &bytes_read,
+            0);
 
-			if (result == ESP_ERR_TIMEOUT)
-			{
-				break;
-			}
-			if (result != ESP_OK)
-			{
-				ESP_LOGE(
-					TAG,
-					"ADC DMA read failed: %s",
-					esp_err_to_name(result));
-				break;
-			}
-			if (bytes_read == 0U)
-			{
-				break;
-			}
+        if (result == ESP_ERR_TIMEOUT)
+        {
+            continue;
+        }
+        if (result != ESP_OK)
+        {
+            ESP_LOGE(
+                TAG,
+                "ADC DMA read failed: %s",
+                esp_err_to_name(result));
+            continue;
+        }
+        if (bytes_read == 0U)
+        {
+            continue;
+        }
 
-			current_sense_publish_frame(frame_buffer, bytes_read, current_sense_take_frame_timestamp());
-		}
-	}
+        current_sense_publish_frame(
+            frame_buffer,
+            bytes_read,
+            current_sense_take_frame_timestamp());
+    }
 }
-
 esp_err_t current_sense_init(void)
 {
 	if (current_adc_handle != NULL)

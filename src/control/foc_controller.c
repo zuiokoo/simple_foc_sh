@@ -24,6 +24,7 @@ void foc_controller_init(
 	}
 	foc_pi_init(&controller->id_pi, id_kp, id_ki, voltage_min_v, voltage_max_v);
 	foc_pi_init(&controller->iq_pi, iq_kp, iq_ki, voltage_min_v, voltage_max_v);
+	controller->id_loop_enabled = true;
 }
 
 void foc_controller_reset(foc_controller_t *controller)
@@ -37,6 +38,52 @@ void foc_controller_reset(foc_controller_t *controller)
 	foc_pi_reset(&controller->iq_pi);
 }
 
+void foc_controller_set_id_loop_enabled(
+	foc_controller_t *controller,
+	bool enabled)
+{
+	if (controller == NULL)
+	{
+		return;
+	}
+
+	controller->id_loop_enabled = enabled;
+	if (!enabled)
+	{
+		foc_pi_reset(&controller->id_pi);
+	}
+}
+
+void foc_controller_set_pi_gains(
+    foc_controller_t *controller,
+    float id_kp,
+    float id_ki,
+    float iq_kp,
+    float iq_ki)
+{
+    if (controller == NULL ||
+        !isfinite(id_kp) || !isfinite(id_ki) ||
+        !isfinite(iq_kp) || !isfinite(iq_ki) ||
+        id_kp < 0.0f || id_ki < 0.0f ||
+        iq_kp < 0.0f || iq_ki < 0.0f)
+    {
+        return;
+    }
+
+    if (controller->id_pi.kp == id_kp &&
+        controller->id_pi.ki == id_ki &&
+        controller->iq_pi.kp == iq_kp &&
+        controller->iq_pi.ki == iq_ki)
+    {
+        return;
+    }
+
+    controller->id_pi.kp = id_kp;
+    controller->id_pi.ki = id_ki;
+    controller->iq_pi.kp = iq_kp;
+    controller->iq_pi.ki = iq_ki;
+    foc_controller_reset(controller);
+}
 esp_err_t foc_controller_step(foc_controller_t *controller, const foc_controller_input_t *input, foc_controller_output_t *output)
 {
 	if (controller == NULL || input == NULL || output == NULL)
@@ -48,8 +95,8 @@ esp_err_t foc_controller_step(foc_controller_t *controller, const foc_controller
 		!isfinite(input->iw_a) ||
 		!isfinite(input->electrical_angle_rad) ||
 		!isfinite(input->output_electrical_angle_rad) ||
-		!isfinite(input->id_ref_a) ||
-		!isfinite(input->iq_ref_a) ||
+		!isfinite(input->id_target_a) ||
+		!isfinite(input->iq_target_a) ||
 		!isfinite(input->dt_s) ||
 		!isfinite(input->bus_voltage_v) ||
 		!isfinite(input->electrical_velocity_rad_s) ||
@@ -82,10 +129,18 @@ esp_err_t foc_controller_step(foc_controller_t *controller, const foc_controller
 	{
 		return result;
 	}
-	output->id_error_a = input->id_ref_a - output->i_d_a;
-	output->iq_error_a = input->iq_ref_a - output->i_q_a;
+	output->id_error_a = input->id_target_a - output->i_d_a;
+	output->iq_error_a = input->iq_target_a - output->i_q_a;
 
-		float vd_pi_v = foc_pi_update(&controller->id_pi, output->id_error_a, input->dt_s);
+	float vd_pi_v = 0.0f;
+	if (controller->id_loop_enabled)
+	{
+		vd_pi_v = foc_pi_update(&controller->id_pi, output->id_error_a, input->dt_s);
+	}
+	else
+	{
+		foc_pi_reset(&controller->id_pi);
+	}
 	float vq_pi_v = foc_pi_update(&controller->iq_pi, output->iq_error_a, input->dt_s);
 
 	/*
@@ -132,13 +187,22 @@ esp_err_t foc_controller_step(foc_controller_t *controller, const foc_controller
 		 */
 		float vd_rejected_v = output->vd_v - vd_unlimited_v;
 		float vq_rejected_v = output->vq_v - vq_unlimited_v;
-		controller->id_pi.integral += vd_rejected_v;
+		if (controller->id_loop_enabled)
+		{
+			controller->id_pi.integral += vd_rejected_v;
+		}
+		else
+		{
+			controller->id_pi.integral = 0.0f;
+		}
 		controller->iq_pi.integral += vq_rejected_v;
-		if (controller->id_pi.integral < controller->id_pi.output_min)
+		if (controller->id_loop_enabled &&
+			controller->id_pi.integral < controller->id_pi.output_min)
 		{
 			controller->id_pi.integral = controller->id_pi.output_min;
 		}
-		else if (controller->id_pi.integral > controller->id_pi.output_max)
+	else if (controller->id_loop_enabled &&
+			controller->id_pi.integral > controller->id_pi.output_max)
 		{
 			controller->id_pi.integral = controller->id_pi.output_max;
 		}

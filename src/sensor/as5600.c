@@ -15,7 +15,7 @@
  * sample, then filter it with a short time constant so delay compensation
  * follows acceleration without turning encoder quantization into noise.
  */
-#define AS5600_VELOCITY_FILTER_TAU_S 0.002f
+#define AS5600_VELOCITY_FILTER_TAU_S 0.020f
 
 static const char *TAG = "AS5600";
 static i2c_master_bus_handle_t as5600_bus;

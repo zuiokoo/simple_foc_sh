@@ -1,7 +1,6 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <math.h>
-#include "control/foc_speed_pi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/portmacro.h"
@@ -14,6 +13,7 @@
 #include "control/foc_math.h"
 #include "control/foc_svpwm.h"
 #include "control/foc_controller.h"
+#include "control/foc_tune_protocol.h"
 #include "control/foc_angle_estimator.h"
 #include <string.h>
 #include <stdlib.h>
@@ -42,14 +42,14 @@ static const char *TAG = "SPI_WS2812";
 static spi_device_handle_t ws2812_spi;
 static uint8_t *ws2812_tx_buffer;
 static foc_controller_t foc_controller;
-static foc_speed_pi_t foc_speed_controller;
 static foc_angle_estimator_t foc_angle_estimator;
 static float foc_electrical_zero_offset_rad = M1_ELECTRICAL_ZERO_OFFSET_RAD;
 typedef struct
 {
 	float dt_s;
+    float id_target_a;
 	float mechanical_speed_rad_s;
-	float iq_ref_a;
+    float iq_target_a;
 	float iu_a;
 	float iv_a;
 	float iw_a;
@@ -89,13 +89,12 @@ typedef struct
 } foc_current_snapshot_t;
 
 static volatile foc_current_snapshot_t foc_current_snapshot;
+static portMUX_TYPE foc_current_snapshot_lock = portMUX_INITIALIZER_UNLOCKED;
 
 // Current-loop timing: four 20 kHz PWM periods = 5 kHz / 200 us.
 #define FOC_CURRENT_TS_S ((float)M1_CURRENT_LOOP_PWM_PERIODS / (float)M1_PWM_FREQUENCY_HZ)
 
 // 当前 d 轴和 q 轴目标电流都为0A，用于零电流数学测试。
-#define FOC_TEST_ID_REF_A M1_CURRENT_LOOP_TEST_ID_REF_A
-#define FOC_TEST_IQ_REF_A M1_CURRENT_LOOP_TEST_IQ_REF_A
 
 // 临时测试参数，不是最终电机参数。
 #define FOC_TEST_ID_PI_KP M1_CURRENT_LOOP_ID_PI_KP
@@ -104,7 +103,7 @@ static volatile foc_current_snapshot_t foc_current_snapshot;
 #define FOC_TEST_IQ_PI_KI M1_CURRENT_LOOP_IQ_PI_KI
 #define FOC_TEST_PI_OUTPUT_MIN_V (-6.0f)
 #define FOC_TEST_PI_OUTPUT_MAX_V (6.0f)
-#define FOC_TEST_CURRENT_LIMIT_A 2.0f
+#define FOC_TEST_CURRENT_LIMIT_A 1.0f
 #define FOC_MAX_ANGLE_AGE_US 5000U
 #define FOC_MAX_CURRENT_AGE_US 1000U
 
@@ -236,41 +235,17 @@ void led_init(void)
 }
 static void led_task(void *pvParameter)
 {
-	while (1)
-	{
-		LED1_ON;
-		LED2_ON;
-		// ESP_LOGI("LED_TASK", "LED1 and LED2 are ON");
-		vTaskDelay(pdMS_TO_TICKS(500));
-		LED1_OFF;
-		LED2_OFF;
-		// ESP_LOGI("LED_TASK", "LED1 and LED2 are OFF");
-		vTaskDelay(pdMS_TO_TICKS(500));
-	}
-}
-static void ws2812_task(void *pvParameter)
-{
+	(void)pvParameter;
 	while (1)
 	{
 		ws2812_set_pixel(0, 100, 0, 0);
 		ws2812_show();
-		ESP_LOGI(TAG, "WS2812: red");
-		vTaskDelay(pdMS_TO_TICKS(1000));
-		ws2812_set_pixel(0, 0, 100, 0);
-		ws2812_show();
-		ESP_LOGI(TAG, "WS2812: green");
-		vTaskDelay(pdMS_TO_TICKS(1000));
-		ws2812_set_pixel(0, 0, 0, 100);
-		ws2812_show();
-		ESP_LOGI(TAG, "WS2812: blue");
-		vTaskDelay(pdMS_TO_TICKS(1000));
-		ws2812_set_pixel(0, 100, 100, 100);
-		ws2812_show();
-		ESP_LOGI(TAG, "WS2812: white");
-		vTaskDelay(pdMS_TO_TICKS(1000));
-		ws2812_clear();
-		ESP_LOGI(TAG, "WS2812: off");
-		vTaskDelay(pdMS_TO_TICKS(1000));
+		LED1_ON;
+		LED2_ON;
+		vTaskDelay(pdMS_TO_TICKS(500));
+		LED1_OFF;
+		LED2_OFF;
+		vTaskDelay(pdMS_TO_TICKS(500));
 	}
 }
 
@@ -279,7 +254,7 @@ static void ws2812_task(void *pvParameter)
  *
  * 该函数默认不执行，只有把配置宏改为 1 后才会在启动时运行一次。
  */
-static void electrical_zero_calibration(void)
+static bool electrical_zero_calibration(void)
 {
 	ESP_LOGW("FOC_CALIB", "Electrical zero calibration is starting");
 	ESP_LOGI("CALIB_CFG", "align duty: U=%.3f V=%.3f W=%.3f",
@@ -287,10 +262,11 @@ static void electrical_zero_calibration(void)
 
 	// U 相略高、V/W 相略低，形成固定在电角度 0 附近的电压矢量。
 	esp_err_t result = motor_pwm_set_duty(0.5f, 0.5f, 0.5f);
+	bool alignment_succeeded = false;
 	if (result != ESP_OK)
 	{
 		ESP_LOGE("FOC_CALIB", "Failed to set alignment duty: %s", esp_err_to_name(result));
-		return;
+		return false;
 	}
 
 	// 占空比已经设置好后，才启动 PWM 输出。
@@ -298,7 +274,7 @@ static void electrical_zero_calibration(void)
 	if (result != ESP_OK)
 	{
 		ESP_LOGE("FOC_CALIB", "Failed to start PWM for alignment: %s", esp_err_to_name(result));
-		return;
+		return false;
 	}
 
     // 从零电压平滑爬升到校准矢量，避免转子被瞬间吸动。
@@ -400,17 +376,45 @@ static void electrical_zero_calibration(void)
                         foc_electrical_zero_offset_rad);
                 }
                 else
-                {
+                {                    /*
+                     * The measured current vector is only a safety/health
+                     * check here. Its angle is not the rotor d-axis angle:
+                     * winding resistance, inductance, ADC bias, and residual
+                     * motion all rotate the current vector. Derive the
+                     * applied stator-voltage vector from the commanded phase
+                     * duties instead, then align the rotor to that known
+                     * vector.
+                     */
+                    float alignment_duty_average =
+                        (M1_ALIGNMENT_DUTY_U +
+                         M1_ALIGNMENT_DUTY_V +
+                         M1_ALIGNMENT_DUTY_W) / 3.0f;
+                    float alignment_vector_u =
+                        M1_ALIGNMENT_DUTY_U - alignment_duty_average;
+                    float alignment_vector_v =
+                        M1_ALIGNMENT_DUTY_V - alignment_duty_average;
+                    float alignment_vector_alpha = alignment_vector_u;
+                    float alignment_vector_beta =
+                        (alignment_vector_u + 2.0f * alignment_vector_v) /
+                        sqrtf(3.0f);
+                    float alignment_vector_angle_rad = atan2f(
+                        alignment_vector_beta,
+                        alignment_vector_alpha);
+                    electrical_zero_offset =
+                        mechanical_electrical_angle - alignment_vector_angle_rad;
                     ESP_LOGI(
                         "FOC_CALIB",
-                        "Alignment current valid: magnitude=%.3f A; using commanded U-axis vector for zero",
-                        alignment_current_magnitude);
+                        "Alignment current valid: magnitude=%.3f A; using commanded vector angle=%.6f rad for zero",
+                        alignment_current_magnitude,
+                        alignment_vector_angle_rad);
                     alignment_valid = true;
                 }
             }
             if (alignment_valid)
             {
-                foc_electrical_zero_offset_rad = electrical_zero_offset;
+                foc_electrical_zero_offset_rad =
+                    electrical_zero_offset + M1_ELECTRICAL_ZERO_TRIM_RAD;
+                    alignment_succeeded = true;
             }
 			ESP_LOGI(
 				"FOC_CALIB",
@@ -430,111 +434,14 @@ static void electrical_zero_calibration(void)
 	{
 		ESP_LOGE("FOC_CALIB", "Failed to stop PWM after alignment: %s", esp_err_to_name(stop_result));
 	}
+
+	return alignment_succeeded;
 }
 /**
  * @brief 根据开环电角度计算三相PWM占空比。
  *
  * 只负责数学计算，不启动PWM。
  */
-static void foc_current_telemetry_task(void *pvParameter)
-{
-	(void)pvParameter;
-	while (1)
-	{
-		foc_current_snapshot_t snapshot = {0};
-		snapshot.dt_s = foc_current_snapshot.dt_s;
-		snapshot.mechanical_speed_rad_s = foc_current_snapshot.mechanical_speed_rad_s;
-		snapshot.iq_ref_a = foc_current_snapshot.iq_ref_a;
-		snapshot.iu_a = foc_current_snapshot.iu_a;
-		snapshot.iv_a = foc_current_snapshot.iv_a;
-		snapshot.iw_a = foc_current_snapshot.iw_a;
-		snapshot.id_a = foc_current_snapshot.id_a;
-		snapshot.iq_a = foc_current_snapshot.iq_a;
-        snapshot.id_error_a = foc_current_snapshot.id_error_a;
-        snapshot.iq_error_a = foc_current_snapshot.iq_error_a;
-		snapshot.vd_v = foc_current_snapshot.vd_v;
-		snapshot.vq_v = foc_current_snapshot.vq_v;
-		snapshot.vd_decoupling_v = foc_current_snapshot.vd_decoupling_v;
-		snapshot.vq_decoupling_v = foc_current_snapshot.vq_decoupling_v;
-		snapshot.voltage_vector_limit_v = foc_current_snapshot.voltage_vector_limit_v;
-		snapshot.duty_u = foc_current_snapshot.duty_u;
-		snapshot.duty_v = foc_current_snapshot.duty_v;
-		snapshot.duty_w = foc_current_snapshot.duty_w;
-	snapshot.missed_ticks = foc_current_snapshot.missed_ticks;
-	snapshot.overrun_count = foc_current_snapshot.overrun_count;
-	snapshot.max_loop_us = foc_current_snapshot.max_loop_us;
-	snapshot.angle_valid = foc_current_snapshot.angle_valid;
-	snapshot.angle_error_count = foc_current_snapshot.angle_error_count;
-        snapshot.angle_age_us = foc_current_snapshot.angle_age_us;
-        snapshot.current_age_us = foc_current_snapshot.current_age_us;
-        snapshot.current_valid = foc_current_snapshot.current_valid;
-        snapshot.angle_stale_count = foc_current_snapshot.angle_stale_count;
-        snapshot.current_stale_count = foc_current_snapshot.current_stale_count;
-        snapshot.fault_code = foc_current_snapshot.fault_code;
-        snapshot.current_sequence = foc_current_snapshot.current_sequence;
-        snapshot.angle_to_current_sample_us = foc_current_snapshot.angle_to_current_sample_us;
-        snapshot.electrical_angle_mrad = foc_current_snapshot.electrical_angle_mrad;
-        snapshot.actual_period_us = foc_current_snapshot.actual_period_us;
-        snapshot.period_min_us = foc_current_snapshot.period_min_us;
-        snapshot.period_max_us = foc_current_snapshot.period_max_us;
-        snapshot.period_jitter_us = foc_current_snapshot.period_jitter_us;
-        snapshot.angle_velocity_mrad_s = foc_current_snapshot.angle_velocity_mrad_s;
-        snapshot.id_pi_integral_v = foc_current_snapshot.id_pi_integral_v;
-        snapshot.iq_pi_integral_v = foc_current_snapshot.iq_pi_integral_v;
-
-		/*
-		 * Do not use floating-point printf here.  Newlib's float formatter
-		 * consumes a large amount of task stack and previously overflowed
-		 * this low-priority telemetry task immediately after startup.
-		 * Values are scaled for readability while keeping the current-loop
-		 * task completely free of logging.
-		 */
-		ESP_LOGI(
-			"FOC_TELEM",
-			"dt_us=%ld period_us=%lu period_min_us=%lu period_max_us=%lu period_jitter_us=%lu speed_mrad_s=%ld angle_velocity_mrad_s=%ld angle_age_us=%lu current_age_us=%lu current_valid=%lu angle_stale=%lu current_stale=%lu fault=%lu current_sequence=%lu angle_to_current_sample_us=%ld electrical_angle_mrad=%ld iq_ref_mA=%ld iu_mA=%ld iv_mA=%ld iw_mA=%ld id_mA=%ld iq_mA=%ld id_err_mA=%ld iq_err_mA=%ld vd_mV=%ld vq_mV=%ld vd_dec_mV=%ld vq_dec_mV=%ld v_limit_mV=%ld id_pi_int_mV=%ld iq_pi_int_mV=%ld duty=%ld/%ld/%ld missed=%lu overrun=%lu max_loop_us=%lu angle_valid=%lu angle_err=%lu",
-			(long)(snapshot.dt_s * 1000000.0f),
-            (unsigned long)snapshot.actual_period_us,
-            (unsigned long)snapshot.period_min_us,
-            (unsigned long)snapshot.period_max_us,
-            (unsigned long)snapshot.period_jitter_us,
-			(long)(snapshot.mechanical_speed_rad_s * 1000.0f),
-            (long)(snapshot.angle_velocity_mrad_s),
-            (unsigned long)snapshot.angle_age_us,
-            (unsigned long)snapshot.current_age_us,
-            (unsigned long)snapshot.current_valid,
-            (unsigned long)snapshot.angle_stale_count,
-            (unsigned long)snapshot.current_stale_count,
-            (unsigned long)snapshot.fault_code,
-            (unsigned long)snapshot.current_sequence,
-            (long)snapshot.angle_to_current_sample_us,
-            (long)snapshot.electrical_angle_mrad,
-			(long)(snapshot.iq_ref_a * 1000.0f),
-			(long)(snapshot.iu_a * 1000.0f),
-			(long)(snapshot.iv_a * 1000.0f),
-			(long)(snapshot.iw_a * 1000.0f),
-			(long)(snapshot.id_a * 1000.0f),
-			(long)(snapshot.iq_a * 1000.0f),
-            (long)(snapshot.id_error_a * 1000.0f),
-            (long)(snapshot.iq_error_a * 1000.0f),
-						(long)(snapshot.vd_v * 1000.0f),
-			(long)(snapshot.vq_v * 1000.0f),
-			(long)(snapshot.vd_decoupling_v * 1000.0f),
-			(long)(snapshot.vq_decoupling_v * 1000.0f),
-			(long)(snapshot.voltage_vector_limit_v * 1000.0f),
-            (long)(snapshot.id_pi_integral_v * 1000.0f),
-            (long)(snapshot.iq_pi_integral_v * 1000.0f),
-			(long)(snapshot.duty_u * 1000.0f),
-			(long)(snapshot.duty_v * 1000.0f),
-			(long)(snapshot.duty_w * 1000.0f),
-			(unsigned long)snapshot.missed_ticks,
-			(unsigned long)snapshot.overrun_count,
-			(unsigned long)snapshot.max_loop_us,
-		(unsigned long)snapshot.angle_valid,
-		(unsigned long)snapshot.angle_error_count);
-
-		vTaskDelay(pdMS_TO_TICKS(1000));
-	}
-}
 static volatile float foc_latest_mechanical_angle_rad = 0.0f;
 static volatile float foc_latest_mechanical_velocity_rad_s = 0.0f;
 static volatile uint32_t foc_latest_angle_timestamp_us = 0U;
@@ -585,7 +492,7 @@ static void foc_angle_sensor_task(void *pvParameter)
     while (1)
     {
         /* The 500 us esp_timer provides the sample cadence; no 1 ms RTOS tick is involved. */
-        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        ulTaskNotifyTake(pdFALSE, portMAX_DELAY);
 
         float mechanical_angle = 0.0f;
         float mechanical_velocity_rad_s = 0.0f;
@@ -629,12 +536,70 @@ static void foc_angle_sensor_task(void *pvParameter)
         }
     }
 }
+static long foc_trace_milli(float value)
+{
+    return isfinite(value) ? (long)lroundf(value * 1000.0f) : 0L;
+}
+
+static void foc_current_telemetry_task(void *pvParameter)
+{
+    (void)pvParameter;
+    int64_t next_diagnostic_us = 0;
+    while (true)
+    {
+        foc_current_snapshot_t snapshot;
+        portENTER_CRITICAL(&foc_current_snapshot_lock);
+        snapshot = foc_current_snapshot;
+        portEXIT_CRITICAL(&foc_current_snapshot_lock);
+
+        int64_t now_us = esp_timer_get_time();
+        if (now_us >= next_diagnostic_us)
+        {
+            ESP_LOGE("FOC_TUNE", "dt_us=%ld speed_mrad_s=%ld angle_age_us=%lu current_age_us=%lu iu_mA=%ld iv_mA=%ld iw_mA=%ld iq_target_mA=%ld id_mA=%ld iq_mA=%ld id_err_mA=%ld iq_err_mA=%ld vd_mV=%ld vq_mV=%ld",
+                foc_trace_milli(snapshot.dt_s * 1000.0f), foc_trace_milli(snapshot.mechanical_speed_rad_s),
+                (unsigned long)snapshot.angle_age_us, (unsigned long)snapshot.current_age_us,
+                foc_trace_milli(snapshot.iu_a), foc_trace_milli(snapshot.iv_a), foc_trace_milli(snapshot.iw_a),
+                 foc_trace_milli(snapshot.iq_target_a),
+                foc_trace_milli(snapshot.id_a), foc_trace_milli(snapshot.iq_a),
+                foc_trace_milli(snapshot.id_error_a), foc_trace_milli(snapshot.iq_error_a),
+                foc_trace_milli(snapshot.vd_v), foc_trace_milli(snapshot.vq_v));
+            next_diagnostic_us = now_us + 1000000;
+        }
+
+        ESP_LOGI("FOC_DATA", "FOC_DATA,%lld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%lu,%lu,%lu",
+            (long long)now_us,
+            foc_trace_milli(snapshot.id_target_a),
+            foc_trace_milli(snapshot.iq_target_a),
+            foc_trace_milli(snapshot.id_a),
+            foc_trace_milli(snapshot.iq_a),
+            foc_trace_milli(snapshot.vd_v),
+            foc_trace_milli(snapshot.vq_v),
+            foc_trace_milli(snapshot.mechanical_speed_rad_s),
+            (unsigned long)snapshot.current_age_us,
+            (unsigned long)snapshot.angle_age_us,
+            (unsigned long)snapshot.fault_code);
+
+        uint32_t rate_hz = foc_tune_get_telemetry_rate_hz();
+        if (rate_hz < FOC_TUNE_MIN_TELEMETRY_RATE_HZ)
+        {
+            rate_hz = FOC_TUNE_MIN_TELEMETRY_RATE_HZ;
+        }
+        uint32_t period_ms = 1000U / rate_hz;
+        if (period_ms == 0U)
+        {
+            period_ms = 1U;
+        }
+        vTaskDelay(pdMS_TO_TICKS(period_ms));
+    }
+}
 static void foc_current_latch_fault(uint32_t fault_code)
 {
+    portENTER_CRITICAL(&foc_current_snapshot_lock);
     foc_current_snapshot.current_valid = 0U;
     foc_current_snapshot.fault_code = fault_code;
+    portEXIT_CRITICAL(&foc_current_snapshot_lock);
+    foc_tune_set_fault_code(fault_code);
     foc_controller_reset(&foc_controller);
-    foc_speed_pi_reset(&foc_speed_controller);
     motor_pwm_set_duty(0.5f, 0.5f, 0.5f);
     motor_pwm_stop();
 
@@ -684,7 +649,6 @@ static void foc_current_task(void *pvParameter)
 	/* Discard notifications accumulated while PWM was being started. */
 	(void)ulTaskNotifyTake(pdTRUE, 0);
 
-	uint32_t loop_count = 0;
     int64_t previous_iteration_start_us = 0;
     uint32_t actual_period_us = 0U;
     uint32_t period_min_us = 0U;
@@ -695,10 +659,7 @@ static void foc_current_task(void *pvParameter)
 	uint32_t current_loop_max_us = 0U;
     uint32_t angle_stale_count = 0U;
     uint32_t current_stale_count = 0U;
-	float iq_ref_a = 0.0f;
-#if M1_ENABLE_SPEED_LOOP
-	float speed_loop_elapsed_s = 0.0f;
-#endif
+    uint32_t applied_pi_sequence = UINT32_MAX;
 	while (1)
 	{
 		uint32_t pending_ticks =
@@ -708,8 +669,45 @@ static void foc_current_task(void *pvParameter)
 			current_loop_missed_ticks += pending_ticks - 1U;
 		}
 
-		loop_count++;
 		int64_t iteration_start_us = esp_timer_get_time();
+        if (foc_tune_take_alignment_request())
+        {
+            foc_controller_reset(&foc_controller);
+            (void)motor_pwm_set_duty(0.5f, 0.5f, 0.5f);
+            (void)motor_pwm_stop();
+            bool alignment_success = electrical_zero_calibration();
+            foc_controller_reset(&foc_controller);
+            esp_err_t restart_result = motor_pwm_set_duty(0.5f, 0.5f, 0.5f);
+            if (restart_result == ESP_OK)
+            {
+                restart_result = motor_pwm_start();
+            }
+            if (restart_result != ESP_OK)
+            {
+                foc_tune_complete_alignment(false, foc_electrical_zero_offset_rad);
+                foc_current_latch_fault(3U);
+            }
+            else
+            {
+                foc_tune_complete_alignment(alignment_success, foc_electrical_zero_offset_rad);
+            }
+            (void)ulTaskNotifyTake(pdTRUE, 0);
+            continue;
+        }
+        foc_tune_pi_config_t pi_config = {0};
+        uint32_t pi_sequence = 0U;
+        foc_tune_get_pi_config(&pi_config, &pi_sequence);
+        if (pi_sequence != applied_pi_sequence)
+        {
+            foc_controller_set_pi_gains(
+                &foc_controller,
+                pi_config.id_kp,
+                pi_config.id_ki,
+                pi_config.iq_kp,
+                pi_config.iq_ki);
+            applied_pi_sequence = pi_sequence;
+        }
+
         /* The PWM event wakes this task; use the newest ADC frame already complete at loop entry. */
         int64_t current_target_timestamp_us =
             motor_pwm_get_control_tick_timestamp_us();
@@ -740,11 +738,6 @@ static void foc_current_task(void *pvParameter)
             }
         }
         previous_iteration_start_us = iteration_start_us;
-#if M1_ENABLE_TIMING_LOG
-		int64_t angle_done_us = 0;
-		int64_t current_done_us = 0;
-		int64_t pwm_done_us = 0;
-#endif
 
         /* PI integration uses the PWM notification interval, not scheduler latency. */
         float control_dt_s = FOC_CURRENT_TS_S;
@@ -773,8 +766,8 @@ static void foc_current_task(void *pvParameter)
         {
             angle_stale_count++;
             foc_controller_reset(&foc_controller);
-            foc_speed_pi_reset(&foc_speed_controller);
             motor_pwm_set_duty(0.5f, 0.5f, 0.5f);
+            portENTER_CRITICAL(&foc_current_snapshot_lock);
             foc_current_snapshot.dt_s = control_dt_s;
             foc_current_snapshot.missed_ticks = current_loop_missed_ticks;
             foc_current_snapshot.overrun_count = current_loop_overrun_count;
@@ -785,6 +778,7 @@ static void foc_current_task(void *pvParameter)
             foc_current_snapshot.current_valid = 0U;
             foc_current_snapshot.angle_age_us = angle_age_us;
             foc_current_snapshot.angle_error_count = foc_angle_error_count;
+            portEXIT_CRITICAL(&foc_current_snapshot_lock);
             continue;
         }
 
@@ -797,9 +791,6 @@ static void foc_current_task(void *pvParameter)
         int64_t angle_to_current_sample_us = 0;
         int32_t electrical_angle_mrad = 0;
 
-#if M1_ENABLE_TIMING_LOG
-		angle_done_us = esp_timer_get_time();
-#endif
         /* 从ADC DMA任务发布的最新帧读取三相电流。 */
 		if (result == ESP_OK)
 		{
@@ -810,9 +801,6 @@ static void foc_current_task(void *pvParameter)
                 current_target_timestamp_us,
                 &current_sample_timestamp_us,
                 &current_sequence);
-#if M1_ENABLE_TIMING_LOG
-			current_done_us = esp_timer_get_time();
-#endif
 		}
         if (result == ESP_OK)
         {
@@ -853,8 +841,8 @@ static void foc_current_task(void *pvParameter)
             current_stale_count++;
             /* Never regulate from a millisecond-old ADC frame. */
             foc_controller_reset(&foc_controller);
-            foc_speed_pi_reset(&foc_speed_controller);
             motor_pwm_set_duty(0.5f, 0.5f, 0.5f);
+            portENTER_CRITICAL(&foc_current_snapshot_lock);
             foc_current_snapshot.dt_s = control_dt_s;
             foc_current_snapshot.current_age_us = current_age_us;
             foc_current_snapshot.current_sequence = current_sequence;
@@ -864,6 +852,7 @@ static void foc_current_task(void *pvParameter)
             foc_current_snapshot.missed_ticks = current_loop_missed_ticks;
             foc_current_snapshot.overrun_count = current_loop_overrun_count;
             foc_current_snapshot.max_loop_us = current_loop_max_us;
+            portEXIT_CRITICAL(&foc_current_snapshot_lock);
             continue;
         }
 		/*
@@ -886,49 +875,13 @@ static void foc_current_task(void *pvParameter)
 			foc_current_latch_fault(1U);
 		}
 
-        float iq_target_a = iq_ref_a;
-#if M1_ENABLE_SPEED_LOOP
-        if (result == ESP_OK)
-        {
-            speed_loop_elapsed_s += control_dt_s;
-            if (speed_loop_elapsed_s >=
-                (float)M1_SPEED_LOOP_PERIOD_MS / 1000.0f)
-            {
-                float speed_feedback_rad_s =
-                    M1_SPEED_FEEDBACK_SIGN * mechanical_velocity_rad_s;
-                result = foc_speed_pi_update(
-                    &foc_speed_controller,
-                    M1_SPEED_REF_RAD_S,
-                    speed_feedback_rad_s,
-                    speed_loop_elapsed_s,
-                    &iq_target_a);
-                speed_loop_elapsed_s = 0.0f;
-            }
-        }
-#else
-        iq_target_a = FOC_TEST_IQ_REF_A;
-#endif
-        if (result == ESP_OK)
-        {
-            float current_reference_ramp =
-                M1_CURRENT_REFERENCE_RAMP_A_PER_S * control_dt_s;
-            float current_reference_error = iq_target_a - iq_ref_a;
-            if (fabsf(current_reference_error) <= current_reference_ramp)
-            {
-                iq_ref_a = iq_target_a;
-            }
-            else
-            {
-                iq_ref_a += copysignf(current_reference_ramp,
-                    current_reference_error);
-            }
-        }
+        float id_target_a = foc_tune_get_id_target_a();
+        float iq_target_a = foc_tune_get_iq_target_a();
+
         /*
-         * current_age_us is measured from the ADC frame midpoint to loop entry.
-         * Add one center-aligned PWM update window (about 50 us) so inverse Park
-         * predicts the angle when the new compare value becomes effective.
+         * Temporary tuning mode: use the measured electrical angle directly.
+         * The speed-based output-angle prediction is intentionally disabled.
          */
-        int64_t estimated_output_delay_us = (int64_t)current_age_us + 50;
         foc_controller_input_t controller_input = {0};
 		foc_controller_output_t controller_output = {0};
 		if (result == ESP_OK)
@@ -937,12 +890,9 @@ static void foc_current_task(void *pvParameter)
 			controller_input.iv_a = iv_a;
 			controller_input.iw_a = iw_a;
 			controller_input.electrical_angle_rad = electrical_angle;
-            /* Compensate the one-sample computation/PWM update delay at high speed. */
-            controller_input.output_electrical_angle_rad = electrical_angle +
-                mechanical_velocity_rad_s * M1_MOTOR_POLE_PAIRS *
-                    ((float)estimated_output_delay_us / 1000000.0f);
-			controller_input.id_ref_a = FOC_TEST_ID_REF_A;
-			controller_input.iq_ref_a = iq_ref_a;
+            controller_input.output_electrical_angle_rad = electrical_angle;
+			controller_input.id_target_a = id_target_a;
+			controller_input.iq_target_a = iq_target_a;
 			controller_input.dt_s = control_dt_s;
 			controller_input.bus_voltage_v = FOC_TEST_BUS_VOLTAGE_V;
 			controller_input.electrical_velocity_rad_s =
@@ -963,9 +913,6 @@ static void foc_current_task(void *pvParameter)
 				controller_output.duty_u,
 				controller_output.duty_v,
 				controller_output.duty_w);
-#if M1_ENABLE_TIMING_LOG
-			pwm_done_us = esp_timer_get_time();
-#endif
 		}
 		if (result == ESP_OK)
 		{
@@ -980,11 +927,12 @@ static void foc_current_task(void *pvParameter)
 			{
 				current_loop_overrun_count++;
 			}
-
-			foc_current_snapshot.dt_s = control_dt_s;
+            portENTER_CRITICAL(&foc_current_snapshot_lock);
+				foc_current_snapshot.dt_s = control_dt_s;
+            foc_current_snapshot.id_target_a = id_target_a;
 			foc_current_snapshot.mechanical_speed_rad_s =
-				M1_SPEED_FEEDBACK_SIGN * mechanical_velocity_rad_s;
-			foc_current_snapshot.iq_ref_a = iq_ref_a;
+				mechanical_velocity_rad_s;
+            foc_current_snapshot.iq_target_a = iq_target_a;
 			foc_current_snapshot.iu_a = iu_a;
 			foc_current_snapshot.iv_a = iv_a;
 			foc_current_snapshot.iw_a = iw_a;
@@ -1024,59 +972,7 @@ static void foc_current_task(void *pvParameter)
             foc_current_snapshot.angle_velocity_mrad_s = mechanical_velocity_rad_s * 1000.0f;
             foc_current_snapshot.id_pi_integral_v = foc_controller.id_pi.integral;
             foc_current_snapshot.iq_pi_integral_v = foc_controller.iq_pi.integral;
-#if M1_ENABLE_CURRENT_TRACE
-if ((loop_count % M1_CURRENT_TRACE_INTERVAL_LOOPS) == 0U)
-			{
-				#if M1_ENABLE_TIMING_LOG
-				ESP_LOGI(
-					"FOC_TIMING",
-					"sample_dt=%.3f ms, angle=%.0f us, current=%.0f us, math_pwm=%.0f us, loop=%.0f us",
-					control_dt_s * 1000.0f,
-					(float)(angle_done_us - iteration_start_us),
-					(float)(current_done_us - angle_done_us),
-					(float)(pwm_done_us - current_done_us),
-					(float)(pwm_done_us - iteration_start_us));
-				#endif
-
-				ESP_LOGI(
-					"FOC_CURRENT_TEST",
-					"dt: %.3f ms, mech: %.2f, elec: %.2f, "
-					"speed_ref: %.3f, speed: %.3f, iq_ref: %.3f, "
-					"iu: %.3f, iv: %.3f, iw: %.3f, "
-					"ialpha: %.3f, ibeta: %.3f, "
-					"id: %.3f, iq: %.3f, "
-					"id_error: %.3f, iq_error: %.3f, "
-					"vd: %.3f V, vq: %.3f V, "
-					"valpha: %.3f V, vbeta: %.3f V, "
-					"u_voltage: %.3f V, v_voltage: %.3f V, w_voltage: %.3f V, "
-					"duty_u: %.3f, duty_v: %.3f, duty_w: %.3f",
-					control_dt_s * 1000.0f,
-					mechanical_angle,
-					electrical_angle,
-					M1_SPEED_REF_RAD_S,
-					M1_SPEED_FEEDBACK_SIGN * mechanical_velocity_rad_s,
-					iq_ref_a,
-					iu_a,
-					iv_a,
-					iw_a,
-					controller_output.i_alpha_a,
-					controller_output.i_beta_a,
-					controller_output.i_d_a,
-					controller_output.i_q_a,
-					controller_output.id_error_a,
-					controller_output.iq_error_a,
-					controller_output.vd_v,
-					controller_output.vq_v,
-					controller_output.v_alpha_v,
-					controller_output.v_beta_v,
-					controller_output.u_voltage_v,
-					controller_output.v_voltage_v,
-					controller_output.w_voltage_v,
-					controller_output.duty_u,
-					controller_output.duty_v,
-					controller_output.duty_w);
-			}
-#endif
+            portEXIT_CRITICAL(&foc_current_snapshot_lock);
 		}
 		else
 		{
@@ -1115,19 +1011,18 @@ void app_main()
 		FOC_TEST_IQ_PI_KI,
 		FOC_TEST_PI_OUTPUT_MIN_V,
 		FOC_TEST_PI_OUTPUT_MAX_V);
-	foc_speed_pi_init(
-		&foc_speed_controller,
-		M1_SPEED_PI_KP,
-		M1_SPEED_PI_KI,
-		-M1_SPEED_IQ_LIMIT_A,
-		M1_SPEED_IQ_LIMIT_A);
+	foc_controller_set_id_loop_enabled(&foc_controller, M1_ENABLE_ID_CURRENT_LOOP);
 #if M1_ENABLE_ELECTRICAL_ZERO_CALIBRATION
 	// 只有明确打开配置宏时，启动阶段才执行一次电角度零点校准。
 	electrical_zero_calibration();
 #endif
-    xTaskCreate(led_task, "led_task", 2048, NULL, 3, NULL);
-    xTaskCreate(ws2812_task, "ws2812_task", 2048, NULL, 3, NULL);
-    xTaskCreatePinnedToCore(foc_angle_sensor_task, "foc_angle_sensor_task", 3072, NULL, 5, NULL, 0);
+    esp_err_t tune_protocol_result = foc_tune_protocol_start();
+    if (tune_protocol_result != ESP_OK)
+    {
+        ESP_LOGE("FOC_TUNE", "command protocol start failed: %s", esp_err_to_name(tune_protocol_result));
+    }
+    xTaskCreate(foc_current_telemetry_task, NULL, 4096, NULL, 4, NULL);
+    xTaskCreate(led_task, "led_status_task", 2048, NULL, 3, NULL);
+    xTaskCreatePinnedToCore(foc_angle_sensor_task, "foc_angle_sensor_task", 3072, NULL, 7, NULL, 0);
     xTaskCreatePinnedToCore(foc_current_task, "foc_current_task", 4096, NULL, 9, NULL, 1);
-    xTaskCreate(foc_current_telemetry_task, "foc_current_telemetry_task", 4096, NULL, 4, NULL);
 }

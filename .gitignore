@@ -6,3 +6,5 @@ test/__pycache__/
 .agents/
 .codex/
 .vscode/
+tools/current_loop_tuner/**/__pycache__/
+*.pyc
